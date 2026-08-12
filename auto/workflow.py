@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -103,6 +104,13 @@ def extract_served_model_name(compose_file: Path) -> str | None:
     return m.group(1) if m else None
 
 
+def extract_tp_from_compose(compose_file: Path) -> str:
+    """Extract tensor-parallel-size from a docker-compose yml file."""
+    content = compose_file.read_text(encoding="utf-8")
+    m = re.search(r"--tensor-parallel-size(?:=|\s+)(\d+)", content)
+    return m.group(1) if m else "1"
+
+
 def compose_up(compose_file: Path) -> None:
     cwd = compose_file.parent
     name = compose_file.name
@@ -128,21 +136,63 @@ def run_test(
     port: int,
     model: str,
     concurrency: int,
+    output_dir: Path,
+    service_name: str,
+    tp: str,
 ) -> None:
-    """Run a test script, injecting PORT, MODEL, CONCURRENCY, COUNT as env vars."""
+    """Run a test script with the workflow settings injected as environment variables."""
     count = concurrency * 10
+    test_name = test_script.stem  # e.g. "rag_bench"
     env = os.environ.copy()
     env["PORT"] = str(port)
     env["MODEL"] = model
     env["CONCURRENCY"] = str(concurrency)
     env["COUNT"] = str(count)
+    env["OUTPUT_DIR"] = str(output_dir)
+    env["SERVICE_NAME"] = service_name
+    env["TEST_NAME"] = test_name
+    env["TP"] = tp
+    env["MODEL"] = model
+    env["CONCURRENCY"] = str(concurrency)
+    env["COUNT"] = str(count)
+    env["OUTPUT_DIR"] = str(output_dir)
+    env["SERVICE_NAME"] = service_name
+    env["TEST_NAME"] = test_name
+    env["TP"] = tp
 
-    LOG.info("[test] %s PORT=%s MODEL=%s CONCURRENCY=%s COUNT=%s",
-             test_script.name, port, model, concurrency, count)
+    # Test scripts may live outside the project directory. Make GuideLLM
+    # available through the child shell's PATH without exposing its location
+    # to individual test scripts.
+    guidellm_path = shutil.which("guidellm", path=env.get("PATH"))
+    if not guidellm_path:
+        candidates = (
+            Path(sys.executable).with_name("guidellm"),
+            Path(__file__).resolve().parents[1] / ".venv" / "bin" / "guidellm",
+        )
+        for candidate in candidates:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                guidellm_path = str(candidate)
+                break
+    if guidellm_path:
+        guidellm_dir = str(Path(guidellm_path).resolve().parent)
+        env["PATH"] = os.pathsep.join(
+            [guidellm_dir, env.get("PATH", "")]
+        ).rstrip(os.pathsep)
+
+    LOG.info(
+        "[test] %s PORT=%s MODEL=%s CONCURRENCY=%s COUNT=%s TP=%s OUTPUT_DIR=%s",
+        test_script.name,
+        port,
+        model,
+        concurrency,
+        count,
+        tp,
+        output_dir,
+    )
 
     # Run test script with output forwarded to screen (stdout/stderr passthrough)
     result = subprocess.run(
-        ["bash", str(test_script)],
+        ["bash", "--norc", "--noprofile", str(test_script)],
         cwd=str(test_script.parent),
         env=env,
     )
@@ -163,6 +213,16 @@ def iterate_files(directory: Path, extensions: tuple[str, ...]) -> list[Path]:
     return files
 
 
+def result_exists(output_dir: Path, service_name: str, tp: str, test_name: str, concurrency: int) -> bool:
+    """Check if results already exist for this combination (json+csv+png)."""
+    base = f"{service_name}.tp{tp}.{test_name}.c{concurrency}"
+    return (
+        (output_dir / f"{base}.json").exists()
+        and (output_dir / f"{base}.csv").exists()
+        and (output_dir / f"{base}.png").exists()
+    )
+
+
 def parse_concurrency(raw: str) -> list[int]:
     values = [int(x.strip()) for x in raw.split(",")]
     if not values:
@@ -180,6 +240,8 @@ def main() -> int:
                         help="Comma-separated concurrency values")
     parser.add_argument("--nostop", action="store_true",
                         help="Keep containers alive after tests (skip compose down)")
+    parser.add_argument("--output", type=Path, default=Path("./results"),
+                        help="Output directory for benchmark results (default: ./results)")
     parser.add_argument("--health-timeout", type=int, default=DEFAULT_HEALTH_TIMEOUT_SEC,
                         help="Health check timeout in seconds (default: 2160)")
     parser.add_argument("--log-level", default="INFO",
@@ -195,7 +257,10 @@ def main() -> int:
 
     service_dir: Path = args.service_dir.resolve()
     test_dir: Path = args.test_dir.resolve()
+    output_dir: Path = args.output.resolve()
     concurrency_values = parse_concurrency(args.concurrency)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     if not service_dir.exists():
         LOG.error("service-dir not found: %s", service_dir)
@@ -216,6 +281,7 @@ def main() -> int:
 
     LOG.info("[config] service-dir: %s (%d services)", service_dir, len(service_files))
     LOG.info("[config] test-dir: %s (%d tests)", test_dir, len(test_files))
+    LOG.info("[config] output: %s", output_dir)
     LOG.info("[config] concurrency: %s", concurrency_values)
     LOG.info("[config] nostop: %s", args.nostop)
 
@@ -235,6 +301,7 @@ def main() -> int:
             try:
                 port = extract_port_from_compose(svc_file)
                 model = extract_model_from_compose(svc_file)
+                tp = extract_tp_from_compose(svc_file)
             except Exception as exc:
                 failures.append(f"{svc_file.name}: parse error: {exc}")
                 LOG.exception("[error] %s", exc)
@@ -267,12 +334,19 @@ def main() -> int:
 
                 # Loop concurrency
                 for conc in concurrency_values:
+                    if result_exists(output_dir, svc_file.stem, tp, test_file.stem, conc):
+                        LOG.info("[skip] %s/%s c=%s — results already exist",
+                                 svc_file.name, test_file.name, conc)
+                        continue
                     try:
                         run_test(
                             test_script=test_file,
                             port=port,
                             model=model,
                             concurrency=conc,
+                            output_dir=output_dir,
+                            service_name=svc_file.stem,
+                            tp=tp,
                         )
                     except Exception as exc:
                         msg = f"{svc_file.name}/{test_file.name} c={conc}: {exc}"
@@ -294,6 +368,7 @@ def main() -> int:
             try:
                 port = extract_port_from_compose(svc_file)
                 model = extract_model_from_compose(svc_file)
+                tp = extract_tp_from_compose(svc_file)
             except Exception as exc:
                 failures.append(f"{svc_file.name}: parse error: {exc}")
                 LOG.exception("[error] %s", exc)
@@ -304,6 +379,10 @@ def main() -> int:
                 LOG.info("[test] %s on %s", test_file.name, svc_file.name)
 
                 for conc in concurrency_values:
+                    if result_exists(output_dir, svc_file.stem, tp, test_file.stem, conc):
+                        LOG.info("[skip] %s/%s c=%s — results already exist",
+                                 svc_file.name, test_file.name, conc)
+                        continue
                     # Start container
                     try:
                         wait_for_port_free(port, DEFAULT_PORT_FREE_WAIT_SEC)
@@ -332,6 +411,9 @@ def main() -> int:
                             port=port,
                             model=model,
                             concurrency=conc,
+                            output_dir=output_dir,
+                            service_name=svc_file.stem,
+                            tp=tp,
                         )
                     except Exception as exc:
                         msg = f"{svc_file.name}/{test_file.name} c={conc}: {exc}"
