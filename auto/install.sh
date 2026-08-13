@@ -12,6 +12,6 @@ echo "[install] Activating virtual environment..."
 source .venv/bin/activate
 
 echo "[install] Installing guidellm in editable mode..."
-pip install -e ".[plot]"
+pip install -e ".[plot,audio,vision]"
 
 echo "[install] Done. Activate with: source $ROOT_DIR/.venv/bin/activate"

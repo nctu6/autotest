@@ -1,0 +1,45 @@
+# Multimodal LLM (vision-language model) served via vLLM
+# Exposes OpenAI-compatible /v1/chat/completions endpoint with image support
+#
+# Usage:
+#   docker compose -f mllm.yml up -d
+#   docker compose -f mllm.yml down
+#
+# Environment variables:
+#   MODEL_PATH       - Path to VLM model (default: /models/Qwen/Qwen2.5-VL-7B-Instruct)
+#   SERVED_MODEL_NAME- Model name exposed via API (default: test)
+#   HOST_PORT        - Port on host (default: 8976)
+#   CUDA_DEVICES     - CUDA device IDs (default: 0)
+#   TENSOR_PARALLEL  - Tensor parallel size (default: 1)
+
+services:
+  mllm-server:
+    image: vllm/vllm-openai:nightly
+    runtime: nvidia
+    ipc: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_VISIBLE_DEVICES=${CUDA_DEVICES:-0}
+      - VLLM_WORKER_MULTIPROCESS_METHOD=spawn
+      - CC=/usr/bin/gcc
+      - CXX=/usr/bin/g++
+      - CUDAHOSTCXX=/usr/bin/g++
+      - CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++      
+    ports:
+      - "${HOST_PORT:-8976}:8976"
+    command: >
+      --model ${MODEL_PATH:-/models/Qwen/Qwen2.5-VL-7B-Instruct}
+      --served-model-name ${SERVED_MODEL_NAME:-test}
+      --host 0.0.0.0
+      --port 8976
+      --tensor-parallel-size ${TENSOR_PARALLEL:-1}
+      --trust-remote-code
+      --dtype bfloat16
+      --limit-mm-per-prompt '{"image":1}'
+    volumes:
+      - /workspace:/workspace
+      - /modelz/models:/models
+    ulimits:
+      memlock: -1
+      stack: 67108864

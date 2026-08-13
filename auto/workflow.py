@@ -78,10 +78,19 @@ def wait_for_health(url: str, timeout_sec: int, interval_sec: int = 6) -> None:
 def extract_port_from_compose(compose_file: Path) -> int:
     """Extract host port from a docker-compose yml file."""
     content = compose_file.read_text(encoding="utf-8")
+    # Match literal port: - "8976:8976" or - 8976:8976
     match = re.search(r'(?m)^\s*-\s*"?(\d+):\d+(?:/\w+)?"?\s*$', content)
-    if not match:
-        raise RuntimeError(f"Cannot extract port from {compose_file}")
-    return int(match.group(1))
+    if match:
+        return int(match.group(1))
+    # Match env var with default: - "${HOST_PORT:-8976}:8976"
+    match = re.search(r'(?m)^\s*-\s*"?\$\{[^:}]+:-(\d+)\}:\d+(?:/\w+)?"?\s*$', content)
+    if match:
+        return int(match.group(1))
+    # Match --port flag in command
+    match = re.search(r'--port\s+(\d+)', content)
+    if match:
+        return int(match.group(1))
+    raise RuntimeError(f"Cannot extract port from {compose_file}")
 
 
 def extract_model_from_compose(compose_file: Path) -> str:
@@ -90,11 +99,11 @@ def extract_model_from_compose(compose_file: Path) -> str:
     # Try --model flag
     m = re.search(r"--model(?:-path)?(?:=|\s+)([^\s\"']+)", content)
     if m:
-        return m.group(1)
+        return _resolve_env_default(m.group(1))
     # Try vllm serve <model>
     m = re.search(r"vllm\s+serve\s+([^\s\"'\\]+)", content)
     if m:
-        return m.group(1)
+        return _resolve_env_default(m.group(1))
     raise RuntimeError(f"Cannot extract model from {compose_file}")
 
 
@@ -107,8 +116,18 @@ def extract_served_model_name(compose_file: Path) -> str | None:
 def extract_tp_from_compose(compose_file: Path) -> str:
     """Extract tensor-parallel-size from a docker-compose yml file."""
     content = compose_file.read_text(encoding="utf-8")
-    m = re.search(r"--tensor-parallel-size(?:=|\s+)(\d+)", content)
-    return m.group(1) if m else "1"
+    m = re.search(r"--tensor-parallel-size(?:=|\s+)([^\s\"']+)", content)
+    if m:
+        return _resolve_env_default(m.group(1))
+    return "1"
+
+
+def _resolve_env_default(value: str) -> str:
+    """Resolve ${VAR:-default} to just 'default'. Pass through literals."""
+    m = re.match(r'^\$\{[^:}]+:-(.+)\}$', value)
+    if m:
+        return m.group(1)
+    return value
 
 
 def compose_up(compose_file: Path) -> None:
