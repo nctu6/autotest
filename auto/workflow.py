@@ -244,16 +244,64 @@ def parse_concurrency(raw: str) -> list[int]:
     return values
 
 
+def parse_config_pairs(config_str: str) -> list[tuple[Path, Path]]:
+    """Parse config string into (service_dir, test_dir) pairs.
+
+    Format:
+        service_dir1,test_dir1
+        service_dir2,test_dir2
+        ...
+
+    Or single-line: service_dir1,test_dir1;service_dir2,test_dir2
+    """
+    pairs: list[tuple[Path, Path]] = []
+    # Support multiline or semicolon-separated
+    lines = config_str.replace(";", "\n").strip().split("\n")
+    for i, line in enumerate(lines, 1):
+        line = line.strip().strip("()")
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 2:
+            LOG.warning("[config] Skipping invalid pair (line %d): '%s' — must be 'service_dir,test_dir'", i, line)
+            continue
+        svc_dir = Path(parts[0])
+        tst_dir = Path(parts[1])
+        if not svc_dir.exists():
+            LOG.warning("[config] Skipping pair (line %d): service-dir not found: %s", i, svc_dir)
+            continue
+        if not tst_dir.exists():
+            LOG.warning("[config] Skipping pair (line %d): test-dir not found: %s", i, tst_dir)
+            continue
+        pairs.append((svc_dir.resolve(), tst_dir.resolve()))
+    return pairs
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="GuideLLM autotest workflow")
+    parser = argparse.ArgumentParser(
+        description="GuideLLM autotest workflow",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Config format (--config):
+  Each line is a pair: service_dir,test_dir
+  Example:
+    --config "
+      /path/to/services1,/path/to/tests1
+      /path/to/services2,/path/to/tests2
+    "
+""",
+    )
+    parser.add_argument("--config", default=None,
+                        help="Pairs of (service_dir,test_dir), one per line or semicolon-separated. "
+                             "Each pair runs service configs against test scripts.")
     parser.add_argument("--service-dir", type=Path, default=None,
-                        help="Directory with docker-compose *.yml service configs (skip if --target is set)")
-    parser.add_argument("--test-dir", type=Path, required=True,
-                        help="Directory with *.sh test configs")
+                        help="(Legacy) Single service dir. Use --config for multiple pairs.")
+    parser.add_argument("--test-dir", type=Path, default=None,
+                        help="(Legacy) Single test dir. Use --config for multiple pairs.")
     parser.add_argument("--target", default=None,
                         help="Test a running service directly (no container management). "
                              "Value is the endpoint URL, e.g. http://127.0.0.1:8976. "
-                             "Requires --model and --service-name.")
+                             "Requires --model, --service-name, --tp, and --test-dir.")
     parser.add_argument("--model", default=None,
                         help="Model/tokenizer path (required with --target)")
     parser.add_argument("--tp", default=None,
@@ -279,24 +327,24 @@ def main() -> int:
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    service_dir = args.service_dir.resolve() if args.service_dir else None
-    test_dir: Path = args.test_dir.resolve()
     output_dir: Path = args.output.resolve()
     concurrency_values = parse_concurrency(args.concurrency)
-
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    if not test_dir.exists():
-        LOG.error("test-dir not found: %s", test_dir)
-        return 1
-
-    test_files = iterate_files(test_dir, (".sh",))
-    if not test_files:
-        LOG.error("No *.sh files in test-dir: %s", test_dir)
-        return 1
 
     # --target mode: test a running service directly, no containers
     if args.target:
+        if not args.test_dir:
+            LOG.error("--test-dir is required with --target")
+            return 1
+        test_dir = args.test_dir.resolve()
+        if not test_dir.exists():
+            LOG.error("test-dir not found: %s", test_dir)
+            return 1
+        test_files = iterate_files(test_dir, (".sh",))
+        if not test_files:
+            LOG.error("No *.sh files in test-dir: %s", test_dir)
+            return 1
+
         missing = []
         if not args.model:
             missing.append("--model")
@@ -367,163 +415,170 @@ def main() -> int:
         LOG.info("[summary] All tests passed.")
         return 0
 
-    # Container modes require --service-dir
-    if not service_dir or not service_dir.exists():
-        LOG.error("--service-dir is required (or use --target for a running service)")
+    # Build config pairs
+    config_pairs: list[tuple[Path, Path]] = []
+    if args.config:
+        config_pairs = parse_config_pairs(args.config)
+    elif args.service_dir and args.test_dir:
+        svc = args.service_dir.resolve()
+        tst = args.test_dir.resolve()
+        if not svc.exists():
+            LOG.error("service-dir not found: %s", svc)
+            return 1
+        if not tst.exists():
+            LOG.error("test-dir not found: %s", tst)
+            return 1
+        config_pairs = [(svc, tst)]
+    else:
+        LOG.error("Provide --config or both --service-dir and --test-dir (or use --target)")
         return 1
 
-    service_files = iterate_files(service_dir, (".yml", ".yaml"))
-    if not service_files:
-        LOG.error("No *.yml/*.yaml files in service-dir: %s", service_dir)
+    if not config_pairs:
+        LOG.error("No valid (service_dir, test_dir) pairs found.")
         return 1
 
-    LOG.info("[config] service-dir: %s (%d services)", service_dir, len(service_files))
-    LOG.info("[config] test-dir: %s (%d tests)", test_dir, len(test_files))
+    LOG.info("[config] %d pair(s) to run", len(config_pairs))
     LOG.info("[config] output: %s", output_dir)
     LOG.info("[config] concurrency: %s", concurrency_values)
     LOG.info("[config] nostop: %s", args.nostop)
 
     failures: list[str] = []
 
-    if args.nostop:
-        # --nostop mode:
-        #   1. loop services
-        #   2. loop tests
-        #      docker compose up
-        #      3. loop concurrency -> run test
-        #      docker compose down (after all concurrency done)
-        for svc_file in service_files:
-            LOG.info("=" * 60)
-            LOG.info("[service] %s", svc_file.name)
+    for pair_idx, (service_dir, test_dir) in enumerate(config_pairs, 1):
+        LOG.info("=" * 60)
+        LOG.info("[pair %d/%d] service-dir: %s", pair_idx, len(config_pairs), service_dir)
+        LOG.info("[pair %d/%d] test-dir: %s", pair_idx, len(config_pairs), test_dir)
 
-            try:
-                port = extract_port_from_compose(svc_file)
-                model = extract_model_from_compose(svc_file)
-                tp = extract_tp_from_compose(svc_file)
-                served_model = extract_served_model_name(svc_file)
-            except Exception as exc:
-                failures.append(f"{svc_file.name}: parse error: {exc}")
-                LOG.exception("[error] %s", exc)
-                continue
+        service_files = iterate_files(service_dir, (".yml", ".yaml"))
+        test_files = iterate_files(test_dir, (".sh",))
 
-            for test_file in test_files:
-                LOG.info("-" * 40)
-                LOG.info("[test] %s on %s", test_file.name, svc_file.name)
+        if not service_files:
+            LOG.warning("[pair %d] No *.yml/*.yaml in service-dir: %s — skipping", pair_idx, service_dir)
+            continue
+        if not test_files:
+            LOG.warning("[pair %d] No *.sh in test-dir: %s — skipping", pair_idx, test_dir)
+            continue
 
-                # Start container
+        if args.nostop:
+            for svc_file in service_files:
+                LOG.info("=" * 60)
+                LOG.info("[service] %s", svc_file.name)
+
                 try:
-                    wait_for_port_free(port, DEFAULT_PORT_FREE_WAIT_SEC)
-                    compose_up(svc_file)
+                    port = extract_port_from_compose(svc_file)
+                    model = extract_model_from_compose(svc_file)
+                    tp = extract_tp_from_compose(svc_file)
+                    served_model = extract_served_model_name(svc_file)
                 except Exception as exc:
-                    failures.append(f"{svc_file.name}/{test_file.name}: startup error: {exc}")
+                    failures.append(f"{svc_file.name}: parse error: {exc}")
                     LOG.exception("[error] %s", exc)
                     continue
 
-                # Wait for health
-                try:
-                    wait_for_health(
-                        f"http://127.0.0.1:{port}/health",
-                        timeout_sec=args.health_timeout,
-                    )
-                except Exception as exc:
-                    failures.append(f"{svc_file.name}/{test_file.name}: health timeout: {exc}")
-                    LOG.exception("[error] %s", exc)
-                    compose_down(svc_file)
-                    continue
+                for test_file in test_files:
+                    LOG.info("-" * 40)
+                    LOG.info("[test] %s on %s", test_file.name, svc_file.name)
 
-                # Loop concurrency
-                for conc in concurrency_values:
-                    if result_exists(output_dir, svc_file.stem, tp, test_file.stem, conc):
-                        LOG.info("[skip] %s/%s c=%s — results already exist",
-                                 svc_file.name, test_file.name, conc)
-                        continue
-                    try:
-                        run_test(
-                            test_script=test_file,
-                            port=port,
-                            model=model,
-                            concurrency=conc,
-                            output_dir=output_dir,
-                            service_name=svc_file.stem,
-                            tp=tp,
-                            served_model=served_model,
-                        )
-                    except Exception as exc:
-                        msg = f"{svc_file.name}/{test_file.name} c={conc}: {exc}"
-                        failures.append(msg)
-                        LOG.exception("[error] %s", msg)
-
-                # Stop container after all concurrency levels
-                compose_down(svc_file)
-    else:
-        # Default mode:
-        #   1. loop services
-        #   2. loop tests
-        #   3. loop concurrency
-        #      docker compose up -> run test -> docker compose down
-        for svc_file in service_files:
-            LOG.info("=" * 60)
-            LOG.info("[service] %s", svc_file.name)
-
-            try:
-                port = extract_port_from_compose(svc_file)
-                model = extract_model_from_compose(svc_file)
-                tp = extract_tp_from_compose(svc_file)
-                served_model = extract_served_model_name(svc_file)
-            except Exception as exc:
-                failures.append(f"{svc_file.name}: parse error: {exc}")
-                LOG.exception("[error] %s", exc)
-                continue
-
-            for test_file in test_files:
-                LOG.info("-" * 40)
-                LOG.info("[test] %s on %s", test_file.name, svc_file.name)
-
-                for conc in concurrency_values:
-                    if result_exists(output_dir, svc_file.stem, tp, test_file.stem, conc):
-                        LOG.info("[skip] %s/%s c=%s — results already exist",
-                                 svc_file.name, test_file.name, conc)
-                        continue
-                    # Start container
                     try:
                         wait_for_port_free(port, DEFAULT_PORT_FREE_WAIT_SEC)
                         compose_up(svc_file)
                     except Exception as exc:
-                        failures.append(f"{svc_file.name}/{test_file.name} c={conc}: startup error: {exc}")
+                        failures.append(f"{svc_file.name}/{test_file.name}: startup error: {exc}")
                         LOG.exception("[error] %s", exc)
                         continue
 
-                    # Wait for health
                     try:
                         wait_for_health(
                             f"http://127.0.0.1:{port}/health",
                             timeout_sec=args.health_timeout,
                         )
                     except Exception as exc:
-                        failures.append(f"{svc_file.name}/{test_file.name} c={conc}: health timeout: {exc}")
+                        failures.append(f"{svc_file.name}/{test_file.name}: health timeout: {exc}")
                         LOG.exception("[error] %s", exc)
                         compose_down(svc_file)
                         continue
 
-                    # Run test
-                    try:
-                        run_test(
-                            test_script=test_file,
-                            port=port,
-                            model=model,
-                            concurrency=conc,
-                            output_dir=output_dir,
-                            service_name=svc_file.stem,
-                            tp=tp,
-                            served_model=served_model,
-                        )
-                    except Exception as exc:
-                        msg = f"{svc_file.name}/{test_file.name} c={conc}: {exc}"
-                        failures.append(msg)
-                        LOG.exception("[error] %s", msg)
+                    for conc in concurrency_values:
+                        if result_exists(output_dir, svc_file.stem, tp, test_file.stem, conc):
+                            LOG.info("[skip] %s/%s c=%s — results already exist",
+                                     svc_file.name, test_file.name, conc)
+                            continue
+                        try:
+                            run_test(
+                                test_script=test_file,
+                                port=port,
+                                model=model,
+                                concurrency=conc,
+                                output_dir=output_dir,
+                                service_name=svc_file.stem,
+                                tp=tp,
+                                served_model=served_model,
+                            )
+                        except Exception as exc:
+                            msg = f"{svc_file.name}/{test_file.name} c={conc}: {exc}"
+                            failures.append(msg)
+                            LOG.exception("[error] %s", msg)
 
-                    # Stop container
                     compose_down(svc_file)
+        else:
+            for svc_file in service_files:
+                LOG.info("=" * 60)
+                LOG.info("[service] %s", svc_file.name)
+
+                try:
+                    port = extract_port_from_compose(svc_file)
+                    model = extract_model_from_compose(svc_file)
+                    tp = extract_tp_from_compose(svc_file)
+                    served_model = extract_served_model_name(svc_file)
+                except Exception as exc:
+                    failures.append(f"{svc_file.name}: parse error: {exc}")
+                    LOG.exception("[error] %s", exc)
+                    continue
+
+                for test_file in test_files:
+                    LOG.info("-" * 40)
+                    LOG.info("[test] %s on %s", test_file.name, svc_file.name)
+
+                    for conc in concurrency_values:
+                        if result_exists(output_dir, svc_file.stem, tp, test_file.stem, conc):
+                            LOG.info("[skip] %s/%s c=%s — results already exist",
+                                     svc_file.name, test_file.name, conc)
+                            continue
+                        try:
+                            wait_for_port_free(port, DEFAULT_PORT_FREE_WAIT_SEC)
+                            compose_up(svc_file)
+                        except Exception as exc:
+                            failures.append(f"{svc_file.name}/{test_file.name} c={conc}: startup error: {exc}")
+                            LOG.exception("[error] %s", exc)
+                            continue
+
+                        try:
+                            wait_for_health(
+                                f"http://127.0.0.1:{port}/health",
+                                timeout_sec=args.health_timeout,
+                            )
+                        except Exception as exc:
+                            failures.append(f"{svc_file.name}/{test_file.name} c={conc}: health timeout: {exc}")
+                            LOG.exception("[error] %s", exc)
+                            compose_down(svc_file)
+                            continue
+
+                        try:
+                            run_test(
+                                test_script=test_file,
+                                port=port,
+                                model=model,
+                                concurrency=conc,
+                                output_dir=output_dir,
+                                service_name=svc_file.stem,
+                                tp=tp,
+                                served_model=served_model,
+                            )
+                        except Exception as exc:
+                            msg = f"{svc_file.name}/{test_file.name} c={conc}: {exc}"
+                            failures.append(msg)
+                            LOG.exception("[error] %s", msg)
+
+                        compose_down(svc_file)
 
     # Summary
     LOG.info("=" * 60)

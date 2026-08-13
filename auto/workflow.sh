@@ -1,26 +1,48 @@
 #!/bin/bash
-# Example: run the autotest workflow
-# Adjust --service-dir and --test-dir to your actual paths.
+# GuideLLM Autotest Workflow
 #
-# Extra options (pass via "$@"):
+# Usage:
+#   bash auto/workflow.sh                         # run with default config below
+#   bash auto/workflow.sh --nostop                # keep container alive across concurrency
+#   bash auto/workflow.sh --concurrency 1,32,128  # custom concurrency values
+#
+# Options (pass via "$@"):
+#   --config          Pairs of (service_dir,test_dir), one per line or semicolon-separated
 #   --nostop          Keep container alive across concurrency levels
-#                     (compose up once per test, down after all concurrency done)
-#   --target URL      Test a running service directly (no container management)
-#                     Requires --model and optionally --service-name, --tp
-#   --model PATH      Model/tokenizer path (required with --target)
-#   --service-name    Service name for output filenames (with --target)
-#   --tp N            Tensor parallel size (with --target, default: 1)
 #   --output          Output directory for benchmark results (default: ./results)
+#   --concurrency     Comma-separated concurrency values (default: 1,16,32,64,128,256,512)
 #   --health-timeout  Health check timeout in seconds (default: 2160)
 #   --log-level       DEBUG|INFO|WARNING|ERROR
 #
+#   --target URL      Test a running service (no container management)
+#                     Requires: --model, --service-name, --tp, --test-dir
+#
+# --config format:
+#   Each line is: service_dir,test_dir
+#   Example:
+#     --config "
+#       /path/to/rag-services,/path/to/rag-tests;
+#       /path/to/mllm-services,/path/to/mllm-tests;
+#     "
+#
+# Legacy (single pair):
+#   --service-dir /path/to/services --test-dir /path/to/tests
+#
 # Examples:
-#   # With containers (default):
-#   ./workflow.sh --nostop
-#   ./workflow.sh --concurrency 1,32,128 --nostop
+#   # Semicolon-separated single-line:
+#   python3 auto/workflow.py --config "/svc1,/test1;/svc2,/test2" --concurrency 1,16,32
+#
+#   # Multiple pairs:
+#   python3 auto/workflow.py --config "
+#     /path/to/rag-service,/path/to/rag-test;
+#     /path/to/mllm-service,/path/to/mllm-test;
+#   " --concurrency 1,16,32 --nostop
 #
 #   # Against a running service (--target mode):
-#   ./workflow.sh --target http://127.0.0.1:8976 --model /models/Qwen/Qwen3.5-9B --service-name qwen9b --tp 1
+#   python3 auto/workflow.py --target http://127.0.0.1:8976 \
+#     --model /models/Qwen/Qwen3.5-9B --service-name qwen9b --tp 1 \
+#     --test-dir /path/to/tests --concurrency 1,16,32
+#
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,9 +55,16 @@ else
     echo "[warn] venv not found at $ROOT_DIR/.venv" >&2
 fi
 
+# Verify guidellm is reachable
+if ! command -v guidellm &>/dev/null; then
+    echo "[error] guidellm not found in PATH. Did you run install.sh?" >&2
+    exit 1
+fi
+
 python3 "$SCRIPT_DIR/workflow.py" \
-  --service-dir "$SCRIPT_DIR/example-service-dir" \
-  --test-dir "$SCRIPT_DIR/example-test-dir" \
+  --config "
+    $SCRIPT_DIR/example-service-dir,$SCRIPT_DIR/example-test-dir
+  " \
   --concurrency 1,16,32,64,128,256,512 \
   --output "$SCRIPT_DIR/results" \
   "$@"
