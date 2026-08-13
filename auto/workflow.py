@@ -110,7 +110,7 @@ def extract_model_from_compose(compose_file: Path) -> str:
 def extract_served_model_name(compose_file: Path) -> str | None:
     content = compose_file.read_text(encoding="utf-8")
     m = re.search(r"--served-model-name(?:=|\s+)([^\s\"']+)", content)
-    return m.group(1) if m else None
+    return _resolve_env_default(m.group(1)) if m else None
 
 
 def extract_tp_from_compose(compose_file: Path) -> str:
@@ -158,6 +158,7 @@ def run_test(
     output_dir: Path,
     service_name: str,
     tp: str,
+    served_model: str | None = None,
 ) -> None:
     """Run a test script with the workflow settings injected as environment variables."""
     count = concurrency * 10
@@ -165,13 +166,7 @@ def run_test(
     env = os.environ.copy()
     env["PORT"] = str(port)
     env["MODEL"] = model
-    env["CONCURRENCY"] = str(concurrency)
-    env["COUNT"] = str(count)
-    env["OUTPUT_DIR"] = str(output_dir)
-    env["SERVICE_NAME"] = service_name
-    env["TEST_NAME"] = test_name
-    env["TP"] = tp
-    env["MODEL"] = model
+    env["SERVED_MODEL"] = served_model or service_name
     env["CONCURRENCY"] = str(concurrency)
     env["COUNT"] = str(count)
     env["OUTPUT_DIR"] = str(output_dir)
@@ -251,10 +246,20 @@ def parse_concurrency(raw: str) -> list[int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="GuideLLM autotest workflow")
-    parser.add_argument("--service-dir", type=Path, required=True,
-                        help="Directory with docker-compose *.yml service configs")
+    parser.add_argument("--service-dir", type=Path, default=None,
+                        help="Directory with docker-compose *.yml service configs (skip if --target is set)")
     parser.add_argument("--test-dir", type=Path, required=True,
                         help="Directory with *.sh test configs")
+    parser.add_argument("--target", default=None,
+                        help="Test a running service directly (no container management). "
+                             "Value is the endpoint URL, e.g. http://127.0.0.1:8976. "
+                             "Requires --model and --service-name.")
+    parser.add_argument("--model", default=None,
+                        help="Model/tokenizer path (required with --target)")
+    parser.add_argument("--tp", default=None,
+                        help="Tensor parallel size (required with --target)")
+    parser.add_argument("--service-name", default=None,
+                        help="Service name for output filenames (required with --target)")
     parser.add_argument("--concurrency", default="1,16,32,64,128,256,512",
                         help="Comma-separated concurrency values")
     parser.add_argument("--nostop", action="store_true",
@@ -274,28 +279,102 @@ def main() -> int:
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    service_dir: Path = args.service_dir.resolve()
+    service_dir = args.service_dir.resolve() if args.service_dir else None
     test_dir: Path = args.test_dir.resolve()
     output_dir: Path = args.output.resolve()
     concurrency_values = parse_concurrency(args.concurrency)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not service_dir.exists():
-        LOG.error("service-dir not found: %s", service_dir)
-        return 1
     if not test_dir.exists():
         LOG.error("test-dir not found: %s", test_dir)
         return 1
 
-    service_files = iterate_files(service_dir, (".yml", ".yaml"))
     test_files = iterate_files(test_dir, (".sh",))
-
-    if not service_files:
-        LOG.error("No *.yml/*.yaml files in service-dir: %s", service_dir)
-        return 1
     if not test_files:
         LOG.error("No *.sh files in test-dir: %s", test_dir)
+        return 1
+
+    # --target mode: test a running service directly, no containers
+    if args.target:
+        missing = []
+        if not args.model:
+            missing.append("--model")
+        if not args.service_name:
+            missing.append("--service-name")
+        if not args.tp:
+            missing.append("--tp")
+        if missing:
+            LOG.error("--target mode requires: --model, --service-name, --tp")
+            LOG.error("Missing: %s", ", ".join(missing))
+            return 1
+
+        from urllib.parse import urlsplit
+        parsed = urlsplit(args.target.rstrip("/"))
+        port = parsed.port or 8976
+        model = args.model
+        tp = args.tp
+        service_name = args.service_name
+
+        LOG.info("[config] mode: --target (no container management)")
+        LOG.info("[config] target: %s", args.target)
+        LOG.info("[config] model: %s", model)
+        LOG.info("[config] tp: %s", tp)
+        LOG.info("[config] service-name: %s", service_name)
+        LOG.info("[config] test-dir: %s (%d tests)", test_dir, len(test_files))
+        LOG.info("[config] output: %s", output_dir)
+        LOG.info("[config] concurrency: %s", concurrency_values)
+
+        # Wait for health
+        health_url = f"{args.target.rstrip('/')}/health"
+        try:
+            wait_for_health(health_url, timeout_sec=args.health_timeout)
+        except Exception as exc:
+            LOG.error("[error] health check failed: %s", exc)
+            return 1
+
+        failures: list[str] = []
+        for test_file in test_files:
+            LOG.info("-" * 40)
+            LOG.info("[test] %s", test_file.name)
+
+            for conc in concurrency_values:
+                if result_exists(output_dir, service_name, tp, test_file.stem, conc):
+                    LOG.info("[skip] %s c=%s — results already exist",
+                             test_file.name, conc)
+                    continue
+                try:
+                    run_test(
+                        test_script=test_file,
+                        port=port,
+                        model=model,
+                        concurrency=conc,
+                        output_dir=output_dir,
+                        service_name=service_name,
+                        tp=tp,
+                    )
+                except Exception as exc:
+                    msg = f"{test_file.name} c={conc}: {exc}"
+                    failures.append(msg)
+                    LOG.exception("[error] %s", msg)
+
+        LOG.info("=" * 60)
+        if failures:
+            LOG.error("[summary] %d failure(s):", len(failures))
+            for f in failures:
+                LOG.error("  - %s", f)
+            return 1
+        LOG.info("[summary] All tests passed.")
+        return 0
+
+    # Container modes require --service-dir
+    if not service_dir or not service_dir.exists():
+        LOG.error("--service-dir is required (or use --target for a running service)")
+        return 1
+
+    service_files = iterate_files(service_dir, (".yml", ".yaml"))
+    if not service_files:
+        LOG.error("No *.yml/*.yaml files in service-dir: %s", service_dir)
         return 1
 
     LOG.info("[config] service-dir: %s (%d services)", service_dir, len(service_files))
@@ -321,6 +400,7 @@ def main() -> int:
                 port = extract_port_from_compose(svc_file)
                 model = extract_model_from_compose(svc_file)
                 tp = extract_tp_from_compose(svc_file)
+                served_model = extract_served_model_name(svc_file)
             except Exception as exc:
                 failures.append(f"{svc_file.name}: parse error: {exc}")
                 LOG.exception("[error] %s", exc)
@@ -366,6 +446,7 @@ def main() -> int:
                             output_dir=output_dir,
                             service_name=svc_file.stem,
                             tp=tp,
+                            served_model=served_model,
                         )
                     except Exception as exc:
                         msg = f"{svc_file.name}/{test_file.name} c={conc}: {exc}"
@@ -388,6 +469,7 @@ def main() -> int:
                 port = extract_port_from_compose(svc_file)
                 model = extract_model_from_compose(svc_file)
                 tp = extract_tp_from_compose(svc_file)
+                served_model = extract_served_model_name(svc_file)
             except Exception as exc:
                 failures.append(f"{svc_file.name}: parse error: {exc}")
                 LOG.exception("[error] %s", exc)
@@ -433,6 +515,7 @@ def main() -> int:
                             output_dir=output_dir,
                             service_name=svc_file.stem,
                             tp=tp,
+                            served_model=served_model,
                         )
                     except Exception as exc:
                         msg = f"{svc_file.name}/{test_file.name} c={conc}: {exc}"

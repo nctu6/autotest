@@ -5,14 +5,22 @@
 # Extra options (pass via "$@"):
 #   --nostop          Keep container alive across concurrency levels
 #                     (compose up once per test, down after all concurrency done)
+#   --target URL      Test a running service directly (no container management)
+#                     Requires --model and optionally --service-name, --tp
+#   --model PATH      Model/tokenizer path (required with --target)
+#   --service-name    Service name for output filenames (with --target)
+#   --tp N            Tensor parallel size (with --target, default: 1)
 #   --output          Output directory for benchmark results (default: ./results)
 #   --health-timeout  Health check timeout in seconds (default: 2160)
 #   --log-level       DEBUG|INFO|WARNING|ERROR
 #
-# Example:
+# Examples:
+#   # With containers (default):
 #   ./workflow.sh --nostop
 #   ./workflow.sh --concurrency 1,32,128 --nostop
-#   ./workflow.sh --output ./my-results --nostop
+#
+#   # Against a running service (--target mode):
+#   ./workflow.sh --target http://127.0.0.1:8976 --model /models/Qwen/Qwen3.5-9B --service-name qwen9b --tp 1
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

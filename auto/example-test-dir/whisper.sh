@@ -14,7 +14,7 @@
 #   TEST_NAME    - test script stem
 #   TP           - tensor parallel size
 
-HOST=0.0.0.0
+HOST=127.0.0.1
 PORT=${PORT:-8976}
 MODEL=${MODEL:-/models/openai/whisper-large-v3}
 CONCURRENCY=${CONCURRENCY:-1}
@@ -23,9 +23,10 @@ OUTPUT_DIR=${OUTPUT_DIR:-./results}
 SERVICE_NAME=${SERVICE_NAME:-whisper}
 TEST_NAME=${TEST_NAME:-whisper}
 TP=${TP:-1}
+SERVED_MODEL=${SERVED_MODEL:-test}
 
 guidellm run \
-  --backend "kind=openai_http,target=http://${HOST}:${PORT},model=whisper,request_format=/v1/audio/transcriptions" \
+  --backend "kind=openai_http,target=http://${HOST}:${PORT},model=${SERVED_MODEL},request_format=/v1/audio/transcriptions" \
   --profile "kind=throughput,max_concurrency=${CONCURRENCY}" \
   --constraint "kind=max_requests,count=${COUNT}" \
   --tokenizer "{\"kind\":\"huggingface_auto\",\"model\":\"${MODEL}\",\"load_kwargs\":{\"use_fast\":false}}" \

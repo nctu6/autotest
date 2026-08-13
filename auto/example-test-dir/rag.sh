@@ -10,7 +10,7 @@
 #   TEST_NAME    - test script stem
 #   TP           - tensor parallel size
 
-HOST=0.0.0.0
+HOST=127.0.0.1
 PORT=${PORT:-8976}
 MODEL=${MODEL:-/models/Qwen/Qwen3.5-9B}
 CONCURRENCY=${CONCURRENCY:-1}
@@ -19,9 +19,10 @@ OUTPUT_DIR=${OUTPUT_DIR:-./results}
 SERVICE_NAME=${SERVICE_NAME:-unknown}
 TEST_NAME=${TEST_NAME:-rag}
 TP=${TP:-1}
+SERVED_MODEL=${SERVED_MODEL:-test}
 
 guidellm run \
-  --backend "kind=openai_http,target=http://${HOST}:${PORT}" \
+  --backend "kind=openai_http,target=http://${HOST}:${PORT},model=${SERVED_MODEL}" \
   --profile "kind=throughput,max_concurrency=${CONCURRENCY}" \
   --constraint "kind=max_requests,count=${COUNT}" \
   --tokenizer "{\"kind\":\"huggingface_auto\",\"model\":\"${MODEL}\",\"load_kwargs\":{\"use_fast\":false}}" \
