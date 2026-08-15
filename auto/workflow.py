@@ -154,22 +154,27 @@ def run_test(
     test_script: Path,
     port: int,
     model: str,
-    concurrency: int,
+    concurrency: int | None,
     output_dir: Path,
     service_name: str,
     tp: str,
     served_model: str | None = None,
+    output_prefix: str = "",
 ) -> None:
     """Run a test script with the workflow settings injected as environment variables."""
-    count = concurrency * 10
     test_name = test_script.stem  # e.g. "rag_bench"
     env = os.environ.copy()
     env["PORT"] = str(port)
     env["MODEL"] = model
     env["SERVED_MODEL"] = served_model or service_name
-    env["CONCURRENCY"] = str(concurrency)
-    env["COUNT"] = str(count)
+    if concurrency is not None:
+        env["CONCURRENCY"] = str(concurrency)
+        env["COUNT"] = str(concurrency * 10)
+        env["RUN_TAG"] = f"c{concurrency}"
+    else:
+        env["RUN_TAG"] = ""
     env["OUTPUT_DIR"] = str(output_dir)
+    env["OUTPUT_PREFIX"] = output_prefix
     env["SERVICE_NAME"] = service_name
     env["TEST_NAME"] = test_name
     env["TP"] = tp
@@ -194,12 +199,11 @@ def run_test(
         ).rstrip(os.pathsep)
 
     LOG.info(
-        "[test] %s PORT=%s MODEL=%s CONCURRENCY=%s COUNT=%s TP=%s OUTPUT_DIR=%s",
+        "[test] %s PORT=%s MODEL=%s CONCURRENCY=%s TP=%s OUTPUT_DIR=%s",
         test_script.name,
         port,
         model,
-        concurrency,
-        count,
+        concurrency or "(test decides)",
         tp,
         output_dir,
     )
@@ -227,9 +231,13 @@ def iterate_files(directory: Path, extensions: tuple[str, ...]) -> list[Path]:
     return files
 
 
-def result_exists(output_dir: Path, service_name: str, tp: str, test_name: str, concurrency: int) -> bool:
+def result_exists(output_dir: Path, service_name: str, tp: str, test_name: str, concurrency: int | None, output_prefix: str = "") -> bool:
     """Check if results already exist for this combination (json+csv+png)."""
-    base = f"{service_name}.tp{tp}.{test_name}.c{concurrency}"
+    prefix = f"{output_prefix}." if output_prefix else ""
+    if concurrency is None:
+        base = f"{prefix}{service_name}.tp{tp}.{test_name}"
+    else:
+        base = f"{prefix}{service_name}.tp{tp}.{test_name}.c{concurrency}"
     return (
         (output_dir / f"{base}.json").exists()
         and (output_dir / f"{base}.csv").exists()
@@ -308,8 +316,8 @@ Config format (--config):
                         help="Tensor parallel size (required with --target)")
     parser.add_argument("--service-name", default=None,
                         help="Service name for output filenames (required with --target)")
-    parser.add_argument("--concurrency", default="1,16,32,64,128,256,512",
-                        help="Comma-separated concurrency values")
+    parser.add_argument("--concurrency", default=None,
+                        help="Comma-separated concurrency values. If not set, loop once with concurrency decided by test script.")
     parser.add_argument("--nostop", action="store_true",
                         help="Keep containers alive after tests (skip compose down)")
     parser.add_argument("--output", type=Path, default=Path("./results"),
@@ -328,7 +336,7 @@ Config format (--config):
     )
 
     output_dir: Path = args.output.resolve()
-    concurrency_values = parse_concurrency(args.concurrency)
+    concurrency_values = parse_concurrency(args.concurrency) if args.concurrency else None
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # --target mode: test a running service directly, no containers
@@ -382,12 +390,13 @@ Config format (--config):
             return 1
 
         failures: list[str] = []
+        output_prefix = test_dir.name
         for test_file in test_files:
             LOG.info("-" * 40)
             LOG.info("[test] %s", test_file.name)
 
-            for conc in concurrency_values:
-                if result_exists(output_dir, service_name, tp, test_file.stem, conc):
+            for conc in (concurrency_values or [None]):
+                if result_exists(output_dir, service_name, tp, test_file.stem, conc, output_prefix):
                     LOG.info("[skip] %s c=%s — results already exist",
                              test_file.name, conc)
                     continue
@@ -400,6 +409,7 @@ Config format (--config):
                         output_dir=output_dir,
                         service_name=service_name,
                         tp=tp,
+                        output_prefix=output_prefix,
                     )
                 except Exception as exc:
                     msg = f"{test_file.name} c={conc}: {exc}"
@@ -439,15 +449,19 @@ Config format (--config):
 
     LOG.info("[config] %d pair(s) to run", len(config_pairs))
     LOG.info("[config] output: %s", output_dir)
-    LOG.info("[config] concurrency: %s", concurrency_values)
+    LOG.info("[config] concurrency: %s", concurrency_values or "(test decides)")
     LOG.info("[config] nostop: %s", args.nostop)
 
     failures: list[str] = []
 
     for pair_idx, (service_dir, test_dir) in enumerate(config_pairs, 1):
+        # Use dir names as prefix to avoid collisions between pairs
+        output_prefix = f"{service_dir.name}.{test_dir.name}"
+
         LOG.info("=" * 60)
         LOG.info("[pair %d/%d] service-dir: %s", pair_idx, len(config_pairs), service_dir)
         LOG.info("[pair %d/%d] test-dir: %s", pair_idx, len(config_pairs), test_dir)
+        LOG.info("[pair %d/%d] output-prefix: %s", pair_idx, len(config_pairs), output_prefix)
 
         service_files = iterate_files(service_dir, (".yml", ".yaml"))
         test_files = iterate_files(test_dir, (".sh",))
@@ -497,8 +511,8 @@ Config format (--config):
                         compose_down(svc_file)
                         continue
 
-                    for conc in concurrency_values:
-                        if result_exists(output_dir, svc_file.stem, tp, test_file.stem, conc):
+                    for conc in (concurrency_values or [None]):
+                        if result_exists(output_dir, svc_file.stem, tp, test_file.stem, conc, output_prefix):
                             LOG.info("[skip] %s/%s c=%s — results already exist",
                                      svc_file.name, test_file.name, conc)
                             continue
@@ -512,6 +526,7 @@ Config format (--config):
                                 service_name=svc_file.stem,
                                 tp=tp,
                                 served_model=served_model,
+                                output_prefix=output_prefix,
                             )
                         except Exception as exc:
                             msg = f"{svc_file.name}/{test_file.name} c={conc}: {exc}"
@@ -538,8 +553,8 @@ Config format (--config):
                     LOG.info("-" * 40)
                     LOG.info("[test] %s on %s", test_file.name, svc_file.name)
 
-                    for conc in concurrency_values:
-                        if result_exists(output_dir, svc_file.stem, tp, test_file.stem, conc):
+                    for conc in (concurrency_values or [None]):
+                        if result_exists(output_dir, svc_file.stem, tp, test_file.stem, conc, output_prefix):
                             LOG.info("[skip] %s/%s c=%s — results already exist",
                                      svc_file.name, test_file.name, conc)
                             continue
@@ -572,6 +587,7 @@ Config format (--config):
                                 service_name=svc_file.stem,
                                 tp=tp,
                                 served_model=served_model,
+                                output_prefix=output_prefix,
                             )
                         except Exception as exc:
                             msg = f"{svc_file.name}/{test_file.name} c={conc}: {exc}"

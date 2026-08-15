@@ -4,13 +4,14 @@
 # Usage:
 #   bash auto/workflow.sh                         # run with default config below
 #   bash auto/workflow.sh --nostop                # keep container alive across concurrency
-#   bash auto/workflow.sh --concurrency 1,32,128  # custom concurrency values
+#   bash auto/workflow.sh --concurrency 1,32,128  # loop concurrency (test uses $CONCURRENCY)
 #
 # Options (pass via "$@"):
 #   --config          Pairs of (service_dir,test_dir), one per line or semicolon-separated
+#   --concurrency     Comma-separated concurrency values. If not set, loop once and
+#                     let the test script decide its own concurrency.
 #   --nostop          Keep container alive across concurrency levels
 #   --output          Output directory for benchmark results (default: ./results)
-#   --concurrency     Comma-separated concurrency values (default: 1,16,32,64,128,256,512)
 #   --health-timeout  Health check timeout in seconds (default: 2160)
 #   --log-level       DEBUG|INFO|WARNING|ERROR
 #
@@ -28,11 +29,22 @@
 # Legacy (single pair):
 #   --service-dir /path/to/services --test-dir /path/to/tests
 #
-# Examples:
-#   # Semicolon-separated single-line:
-#   python3 auto/workflow.py --config "/svc1,/test1;/svc2,/test2" --concurrency 1,16,32
+# Output filename convention:
+#   ${OUTPUT_PREFIX}.${SERVICE_NAME}.tp${TP}.${TEST_NAME}.${RUN_TAG}.{json,csv,png}
+#   - OUTPUT_PREFIX = service_dir_name.test_dir_name (auto from --config pair)
+#   - RUN_TAG = c${CONCURRENCY} (when --concurrency is set) or empty (test decides)
 #
-#   # Multiple pairs:
+# Examples:
+#   # No --concurrency (test script decides, loop once per test):
+#   python3 auto/workflow.py --config "/svc,/tests" --nostop
+#
+#   # With --concurrency (workflow loops each value):
+#   python3 auto/workflow.py --config "/svc,/tests" --concurrency 1,16,32,64
+#
+#   # Semicolon-separated single-line:
+#   python3 auto/workflow.py --config "/svc1,/test1;/svc2,/test2"
+#
+#   # Multiple pairs (multiline):
 #   python3 auto/workflow.py --config "
 #     /path/to/rag-service,/path/to/rag-test;
 #     /path/to/mllm-service,/path/to/mllm-test;
@@ -65,6 +77,5 @@ python3 "$SCRIPT_DIR/workflow.py" \
   --config "
     $SCRIPT_DIR/example-service-dir,$SCRIPT_DIR/example-test-dir
   " \
-  --concurrency 1,16,32,64,128,256,512 \
   --output "$SCRIPT_DIR/results" \
   "$@"

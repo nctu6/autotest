@@ -24,6 +24,11 @@ SERVICE_NAME=${SERVICE_NAME:-mllm}
 TEST_NAME=${TEST_NAME:-mllm}
 TP=${TP:-1}
 SERVED_MODEL=${SERVED_MODEL:-test}
+RUN_TAG=${RUN_TAG:-c${CONCURRENCY}}
+OUTPUT_PREFIX=${OUTPUT_PREFIX:-}
+
+# Build output base name
+OUT_BASE="${OUTPUT_PREFIX:+${OUTPUT_PREFIX}.}${SERVICE_NAME}.tp${TP}.${TEST_NAME}${RUN_TAG:+.${RUN_TAG}}"
 
 guidellm run \
   --backend "kind=openai_http,target=http://${HOST}:${PORT},model=${SERVED_MODEL},request_format=/v1/chat/completions" \
@@ -32,7 +37,7 @@ guidellm run \
   --tokenizer "{\"kind\":\"huggingface_auto\",\"model\":\"${MODEL}\",\"load_kwargs\":{\"use_fast\":false}}" \
   --data '{"kind":"huggingface","source":"lmms-lab/VQAv2","load_kwargs":{"split":"validation"}}' \
   --data-column-mapper '{"kind":"generative_column_mapper","column_mappings":{"text_column":"question","image_column":"image"}}' \
-  --output "kind=json,path=${OUTPUT_DIR}/${SERVICE_NAME}.tp${TP}.${TEST_NAME}.c${CONCURRENCY}.json" \
-  --output "kind=csv,path=${OUTPUT_DIR}/${SERVICE_NAME}.tp${TP}.${TEST_NAME}.c${CONCURRENCY}.csv" \
-  --output "kind=plot,path=${OUTPUT_DIR}/${SERVICE_NAME}.tp${TP}.${TEST_NAME}.c${CONCURRENCY}.png" \
+  --output "kind=json,path=${OUTPUT_DIR}/${OUT_BASE}.json" \
+  --output "kind=csv,path=${OUTPUT_DIR}/${OUT_BASE}.csv" \
+  --output "kind=plot,path=${OUTPUT_DIR}/${OUT_BASE}.png" \
   --seed "kind=static,value=0"
