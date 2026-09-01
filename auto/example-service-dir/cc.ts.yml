@@ -1,0 +1,60 @@
+# Qwen3.5-27B served via TokenSpeed (LightSeek Foundation's speed-of-light
+# LLM inference engine, purpose-built for agentic workloads).
+#
+# TokenSpeed is not a separate serving framework: it ships as a runner backend
+# inside vLLM (vLLM v0.18+ is the day-0 integration platform) and is activated
+# with the VLLM_USE_TOKENSPEED_RUNNER=1 environment variable. The HTTP surface
+# stays the standard OpenAI-compatible /v1/chat/completions endpoint, so
+# example-test-dir/cc.sh works unchanged.
+#
+# NOTE: Verify the exact image tag and repository against LightSeek Foundation's
+# release notes / Docker Hub before pulling -- tag naming may differ. Override
+# with the TS_IMAGE env var if needed.
+#
+# Usage:
+#   docker compose -f cc.ts.yml up -d
+#   docker compose -f cc.ts.yml down
+#
+# Environment variables:
+#   TS_IMAGE          - TokenSpeed-enabled vLLM image (default: vllm/vllm-openai:v0.18.0-tokenspeed)
+#   MODEL_PATH        - Path to model (default: /models/Qwen/Qwen3.5-27B)
+#   SERVED_MODEL_NAME - Model name exposed via API (default: test)
+#   HOST_PORT         - Port on host (default: 8976)
+#   CUDA_DEVICES      - CUDA device IDs (default: 0)
+#   TENSOR_PARALLEL   - Tensor parallel size (default: 1)
+
+services:
+  cc-tokenspeed:
+    image: vllm/vllm-openai:v0.18.0-tokenspeed
+    runtime: nvidia
+    ipc: host
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+      - CUDA_VISIBLE_DEVICES=${CUDA_DEVICES:-0}
+      - VLLM_WORKER_MULTIPROCESS_METHOD=spawn
+      # Activate the TokenSpeed runner backend inside vLLM
+      - VLLM_USE_TOKENSPEED_RUNNER=1
+      - CC=/usr/bin/gcc
+      - CXX=/usr/bin/g++
+      - CUDAHOSTCXX=/usr/bin/g++
+      - CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++
+    ports:
+      - "${HOST_PORT:-8976}:8976"
+    command: >
+      --model ${MODEL_PATH:-/models/Qwen/Qwen3.5-27B}
+      --served-model-name ${SERVED_MODEL_NAME:-test}
+      --host 0.0.0.0
+      --port 8976
+      --tensor-parallel-size ${TENSOR_PARALLEL:-1}
+      --trust-remote-code
+      --dtype bfloat16
+      --max-num-seqs 452
+      --enable-prefix-caching
+    volumes:
+      - /workspace:/workspace
+      - /modelz/models:/models
+    ulimits:
+      memlock: -1
+      stack: 67108864
