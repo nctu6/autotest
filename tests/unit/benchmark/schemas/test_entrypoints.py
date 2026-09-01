@@ -14,10 +14,12 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from guidellm.backends.backend import BackendArgs
-from guidellm.backends.openai.http import OpenAIHTTPBackendArgs
-from guidellm.backends.openai.websocket import OpenAIWebSocketBackendArgs
-from guidellm.benchmark.schemas.entrypoints import (
+from guidellm.schemas.backends import (
+    BackendArgs,
+    OpenAIHTTPBackendArgs,
+    OpenAIWebSocketBackendArgs,
+)
+from guidellm.schemas.benchmark import (
     BenchmarkArgs,
     BenchmarkScenario,
     GenerativeMetricsArgs,
@@ -27,11 +29,11 @@ from guidellm.utils.typing import BLANK
 
 # Conditionally import VLLM backend args if available
 try:
-    from guidellm.backends.vllm_python.vllm import VLLMPythonBackendArgs
+    from guidellm.schemas.backends import VLLMPythonAsyncBackendArgs
 
     HAS_VLLM = True
 except ImportError:
-    VLLMPythonBackendArgs = None  # type: ignore[assignment, misc]
+    VLLMPythonAsyncBackendArgs = None  # type: ignore[assignment, misc]
     HAS_VLLM = False
 
 # Minimal required data pipeline fields for BenchmarkArgs
@@ -215,15 +217,15 @@ class TestBackendArgsTransformation:
         args = BenchmarkArgs.model_validate(
             {
                 "backend": {
-                    "kind": "vllm_python",
+                    "kind": "vllm_python_async",
                     "model": "facebook/opt-125m",
                 },
                 **_PIPELINE_DEFAULTS,
             }
         )
 
-        assert VLLMPythonBackendArgs is not None
-        assert isinstance(args.backend, VLLMPythonBackendArgs)
+        assert VLLMPythonAsyncBackendArgs is not None
+        assert isinstance(args.backend, VLLMPythonAsyncBackendArgs)
         assert args.backend.model == "facebook/opt-125m"
 
     @pytest.mark.skipif(not HAS_VLLM, reason="VLLM not installed")
@@ -237,7 +239,7 @@ class TestBackendArgsTransformation:
             BenchmarkArgs.model_validate(
                 {
                     "backend": {
-                        "kind": "vllm_python",
+                        "kind": "vllm_python_async",
                         "target": "http://localhost:9000",
                         "model": "facebook/opt-125m",
                     },
@@ -388,14 +390,14 @@ class TestBackendArgsTransformation:
             args_vllm = BenchmarkArgs.model_validate(
                 {
                     "backend": {
-                        "kind": "vllm_python",
+                        "kind": "vllm_python_async",
                         "model": "facebook/opt-125m",
                     },
                     **_PIPELINE_DEFAULTS,
                 }
             )
-            assert VLLMPythonBackendArgs is not None
-            assert isinstance(args_vllm.backend, VLLMPythonBackendArgs)
+            assert VLLMPythonAsyncBackendArgs is not None
+            assert isinstance(args_vllm.backend, VLLMPythonAsyncBackendArgs)
 
 
 class TestBenchmarkScenario:

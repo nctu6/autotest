@@ -11,18 +11,21 @@ from unittest.mock import Mock, patch
 import pytest
 from pydantic import Field, ValidationError
 
-from guidellm.backends import Backend, BackendArgs
+from guidellm.backends import Backend
 from guidellm.backends.openai import (
     OpenAIHTTPBackend,
     OpenAIWebSocketBackend,
-    OpenAIWebSocketBackendArgs,
 )
-from guidellm.backends.openai.http import OpenAIHTTPBackendArgs
-from guidellm.backends.vllm_python.vllm import (
-    VLLMPythonBackend,
-    VLLMPythonBackendArgs,
-)
+from guidellm.backends.vllm_python.batch import VLLMPythonBatchBackend
+from guidellm.backends.vllm_python.vllm import VLLMPythonAsyncBackend
 from guidellm.schemas import GenerationRequest, PydanticClassRegistryMixin, RequestInfo
+from guidellm.schemas.backends import (
+    BackendArgs,
+    OpenAIHTTPBackendArgs,
+    OpenAIWebSocketBackendArgs,
+    VLLMPythonAsyncBackendArgs,
+    VLLMPythonBatchBackendArgs,
+)
 from guidellm.utils.registry import RegistryMixin
 from tests.unit.testing_utils import async_timeout
 
@@ -483,17 +486,29 @@ class TestBackend:
         assert backend.kind == "openai_http"
 
     @pytest.mark.smoke
-    def test_vllm_python_backend_registered(self):
+    def test_vllm_python_async_backend_registered(self):
         """
-        Test that vllm_python backend is registered and createable.
+        Test that vllm_python_async backend is registered and createable.
+        ## WRITTEN BY AI ##
+        """
+        assert Backend.is_registered("vllm_python_async")
+        args = VLLMPythonAsyncBackendArgs(model="test-model")
+        backend = Backend.create(args)
+        assert isinstance(backend, VLLMPythonAsyncBackend)
+        assert backend._args.model == "test-model"
+        assert backend.kind == "vllm_python_async"
+
+    @pytest.mark.regression
+    def test_vllm_python_kind_alias_registered(self):
+        """
+        vllm_python remains accepted as an alias for vllm_python_async.
         ## WRITTEN BY AI ##
         """
         assert Backend.is_registered("vllm_python")
-        args = VLLMPythonBackendArgs(model="test-model")
+        args = VLLMPythonAsyncBackendArgs(kind="vllm_python", model="test-model")
         backend = Backend.create(args)
-        assert isinstance(backend, VLLMPythonBackend)
-        assert backend._args.model == "test-model"
-        assert backend.kind == "vllm_python"
+        assert isinstance(backend, VLLMPythonAsyncBackend)
+        assert backend._args.kind == "vllm_python"
 
     @pytest.mark.smoke
     def test_backend_registry_functionality(self):
@@ -557,6 +572,21 @@ class TestBackend:
         backend = Backend.create(args)
         assert isinstance(backend, TestDecoratorBackend)
         assert backend.info == {"test_param": "custom"}
+
+    @pytest.mark.smoke
+    def test_vllm_python_batch_backend_registered(self):
+        """
+        Test that vllm_python_batch backend is registered and createable.
+        ## WRITTEN BY AI ##
+        """
+        assert Backend.is_registered("vllm_python_batch")
+        args = VLLMPythonBatchBackendArgs(model="test-model")
+        backend = Backend.create(args)
+        assert isinstance(backend, VLLMPythonBatchBackend)
+        assert isinstance(backend, VLLMPythonAsyncBackend)
+        assert backend._args.model == "test-model"
+        assert backend._args.batch_size == 32
+        assert backend.kind == "vllm_python_batch"
 
     @pytest.mark.smoke
     def test_registered_objects(self):

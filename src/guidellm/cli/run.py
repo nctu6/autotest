@@ -6,12 +6,11 @@ from pathlib import Path
 import click
 from pydantic import ValidationError
 
+import guidellm.entrypoints as entry
 import guidellm.utils.cli as cli_tools
-from guidellm.benchmark import (
+from guidellm.schemas.benchmark import (
     BenchmarkArgs,
     BenchmarkScenario,
-    GenerativeConsoleBenchmarkerProgress,
-    benchmark_generative_text,
     get_builtin_scenarios,
 )
 from guidellm.settings import Settings
@@ -147,10 +146,10 @@ def run(**kwargs):  # noqa: C901, PLR0915
         raise format_validation_errors(ctx, err, base_class=BenchmarkScenario) from err
 
     asyncio.run(
-        benchmark_generative_text(
+        entry.benchmark_generative_text(
             args=args,
             progress=(
-                GenerativeConsoleBenchmarkerProgress()
+                entry.GenerativeConsoleBenchmarkerProgress()
                 if not disable_console_interactive
                 else None
             ),

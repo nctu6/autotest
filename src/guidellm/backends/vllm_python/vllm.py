@@ -14,13 +14,17 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import jinja2
 from more_itertools import roundrobin
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field
 
-from guidellm.backends.backend import Backend, BackendArgs
+from guidellm.backends.backend import Backend
+from guidellm.backends.vllm_python.common import (
+    reset_cpu_affinity,
+    vllm_benchmark_engine_config,
+)
 from guidellm.backends.vllm_python.vllm_response import VLLMResponseHandler
 from guidellm.extras import vllm
 from guidellm.logger import logger
@@ -30,85 +34,13 @@ from guidellm.schemas import (
     RequestInfo,
     StandardBaseModel,
 )
+from guidellm.schemas.backends import BackendArgs, VLLMPythonAsyncBackendArgs
 from guidellm.utils import audio, vision
 
 # Sentinel for "chat template not yet resolved" cache.
 _CHAT_TEMPLATE_UNSET: object = object()
 
-__all__ = ["VLLMPythonBackend", "VLLMPythonBackendArgs"]
-
-
-@BackendArgs.register("vllm_python")
-class VLLMPythonBackendArgs(BackendArgs):
-    """Pydantic model for VLLM Python backend creation arguments."""
-
-    kind: Literal["vllm_python"] = Field(
-        default="vllm_python",
-        description="Backend type identifier for VLLM Python backend.",
-    )
-    model: str = Field(
-        description="Huggingface model identifier or filesystem path for VLLM to load",
-        examples=["meta-llama/Llama-2-7b-chat-hf"],
-    )
-    vllm_config: dict[str, Any] = Field(
-        default_factory=dict,
-        description=(
-            "Configuration dictionary for vLLM AsyncEngineArgs parameters. Pass "
-            "any valid AsyncEngineArgs parameters here (e.g. tensor_parallel_size, "
-            "gpu_memory_utilization, max_model_len). The 'model' parameter is required "
-            "and can be set here or via the top-level 'model' field; if set in both "
-            "places, the top-level 'model' field takes precedence."
-        ),
-        examples=[
-            {
-                "tensor_parallel_size": 1,
-                "gpu_memory_utilization": 0.9,
-            }
-        ],
-    )
-    request_format: Literal["plain", "default-template"] | str = Field(
-        default="default-template",
-        description=(
-            "Request format for VLLM Python backend. "
-            "Valid values are 'plain' (no chat template), 'default-template' "
-            "(use tokenizer default), or a path to / inline Jinja2 chat template."
-        ),
-        examples=[
-            "/path/to/chat_template.jinja2",
-        ],
-    )
-    stream: bool = Field(
-        default=True,
-        description="Whether to stream responses from the backend.",
-    )
-    image_placeholder: str = Field(
-        default="<image>",
-        description=(
-            "Placeholder string for image items in multimodal prompts. "
-            "Used when injecting placeholders for multimodal data."
-        ),
-    )
-    audio_placeholder: str = Field(
-        default="<|audio|>",
-        description=(
-            "Placeholder string for audio items in multimodal prompts. "
-            "Used when injecting placeholders for multimodal data."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def validate_vllm_config(self):
-        """Set defaults on vllm_config and ensure model is set."""
-
-        if "model" in self.vllm_config:
-            logger.warning(
-                "The `model` input was passed to the vllm python backend "
-                "with the `vllm_config` input. Ignoring and overwriting "
-                "with the value from the `model` input."
-            )
-        self.vllm_config["model"] = self.model
-
-        return self
+__all__ = ["VLLMPythonAsyncBackend"]
 
 
 class _ResolvedRequest(StandardBaseModel):
@@ -131,15 +63,15 @@ def _has_jinja2_markers(s: str) -> bool:
     return "{{" in s or "{%" in s or "{#" in s
 
 
-@Backend.register("vllm_python")
-class VLLMPythonBackend(Backend):
+@Backend.register(["vllm_python_async", "vllm_python"])
+class VLLMPythonAsyncBackend(Backend):
     """
     Python API backend for VLLM inference engine.
 
     Engine parameters not set in vllm_config use vLLM's AsyncEngineArgs defaults.
     Example:
     ::
-        backend = VLLMPythonBackend(model="meta-llama/Llama-2-7b-chat-hf")
+        backend = VLLMPythonAsyncBackend(model="meta-llama/Llama-2-7b-chat-hf")
         # Or: vllm_config={"tensor_parallel_size": 1, "gpu_memory_utilization": 0.9}
 
         await backend.process_startup()
@@ -148,16 +80,16 @@ class VLLMPythonBackend(Backend):
         await backend.process_shutdown()
     """
 
-    _args: VLLMPythonBackendArgs
+    _args: VLLMPythonAsyncBackendArgs
 
     @classmethod
     def backend_args(cls) -> type[BackendArgs]:
         """Return the Pydantic model for this backend's creation arguments."""
-        return VLLMPythonBackendArgs
+        return VLLMPythonAsyncBackendArgs
 
     def __init__(
         self,
-        arguments: VLLMPythonBackendArgs,
+        arguments: VLLMPythonAsyncBackendArgs,
     ):
         """
         Initialize VLLM Python backend with model and configuration.
@@ -186,7 +118,10 @@ class VLLMPythonBackend(Backend):
         if self._in_process:
             raise RuntimeError("Backend already started up for process.")
 
-        engine_args = vllm.AsyncEngineArgs(**self._args.vllm_config)
+        reset_cpu_affinity()
+        engine_args = vllm.AsyncEngineArgs(
+            **vllm_benchmark_engine_config(self._args.vllm_config),
+        )
         self._engine = vllm.AsyncLLMEngine.from_engine_args(engine_args)
         self._in_process = True
 
@@ -497,11 +432,16 @@ class VLLMPythonBackend(Backend):
             # Safe to mutate: vLLM runs one model per engine and the resolved
             # template is constant across all requests for this backend instance.
             tokenizer.chat_template = resolved  # type: ignore[attr-defined]
-        prompt = tokenizer.apply_chat_template(
-            formatted_messages,  # type: ignore[arg-type]
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        try:
+            prompt = tokenizer.apply_chat_template(
+                formatted_messages,  # type: ignore[arg-type]
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except ValueError:
+            if self._args.request_format == "default-template":
+                return self._extract_prompt_chat_plain(formatted_messages)
+            raise
         if isinstance(prompt, str):
             return prompt
         raise RuntimeError("Backend received unexpected type from tokenizer.")

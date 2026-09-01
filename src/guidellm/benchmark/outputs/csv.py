@@ -19,32 +19,17 @@ from pydantic import Field
 
 from guidellm.benchmark.outputs.output import GenerativeBenchmarkerOutput
 from guidellm.benchmark.schemas import (
-    BenchmarkOutputArgs,
     GenerativeBenchmark,
     GenerativeBenchmarksReport,
 )
 from guidellm.schemas import DistributionSummary, StatusDistributionSummary
-from guidellm.settings import settings
+from guidellm.schemas.benchmark import BenchmarkOutputArgs
+from guidellm.schemas.benchmark.outputs import CSVBenchmarkOutputArgs
 from guidellm.utils.functions import safe_format_timestamp
 
 __all__ = [
-    "CSVBenchmarkOutputArgs",
     "GenerativeBenchmarkerCSV",
 ]
-
-
-@BenchmarkOutputArgs.register("csv")
-class CSVBenchmarkOutputArgs(BenchmarkOutputArgs):
-    """Model for CSV benchmark output arguments."""
-
-    kind: Literal["csv"] = Field(
-        default="csv",
-        description="The kind of output.",
-    )
-    path: Path = Field(
-        default_factory=lambda: settings.default_results_dir / "benchmarks.csv",
-        description="The file to save the output to.",
-    )
 
 
 TIMESTAMP_FORMAT: Annotated[str, "Format string for timestamp output in CSV files"] = (
@@ -420,6 +405,23 @@ class GenerativeBenchmarkerCSV(GenerativeBenchmarkerOutput):
         self._add_stats_for_metric(
             headers, values, benchmark.metrics.request_latency, "Request Latency", "Sec"
         )
+        # None for strategies without an arrival schedule; emit no columns.
+        if benchmark.metrics.request_dispatch_delay is not None:
+            self._add_stats_for_metric(
+                headers,
+                values,
+                benchmark.metrics.request_dispatch_delay,
+                "Dispatch Delay",
+                "Sec",
+            )
+        if benchmark.metrics.request_scheduled_latency is not None:
+            self._add_stats_for_metric(
+                headers,
+                values,
+                benchmark.metrics.request_scheduled_latency,
+                "Scheduled Latency",
+                "Sec",
+            )
         self._add_stats_for_metric(
             headers,
             values,
@@ -453,6 +455,20 @@ class GenerativeBenchmarkerCSV(GenerativeBenchmarkerOutput):
             values,
             benchmark.metrics.inter_token_latency_ms,
             "Inter Token Latency",
+            "ms",
+        )
+        self._add_stats_for_metric(
+            headers,
+            values,
+            benchmark.metrics.time_to_last_round_trip_ms,
+            "Time To Last Round Trip",
+            "ms",
+        )
+        self._add_stats_for_metric(
+            headers,
+            values,
+            benchmark.metrics.avg_round_trip_time_ms,
+            "Avg Round Trip Time",
             "ms",
         )
 

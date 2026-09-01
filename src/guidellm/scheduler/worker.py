@@ -11,6 +11,7 @@ status updates throughout request processing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import traceback
 from collections.abc import AsyncIterator
@@ -238,6 +239,10 @@ class WorkerProcess(Generic[RequestT, ResponseT]):
                 poll_interval=self.messaging.poll_interval,
             )
             processing_task.cancel()
+            # Let in-flight nodes finish reporting their own terminal update
+            # before the sweep below, so a node is never reported twice.
+            with contextlib.suppress(asyncio.CancelledError):
+                await processing_task
 
             # 4. Cancel pending requests until proc canceled (manual, shutdown, error)
             await self._cancel_requests_loop()
@@ -329,7 +334,7 @@ class WorkerProcess(Generic[RequestT, ResponseT]):
                 node = state.graph.nodes[node_id]
                 request_info = state.request_infos.get(node_id)
                 if request_info is not None:
-                    request_info.scheduler_node_id = self.messaging.worker_index or -1
+                    request_info.scheduler_node_id = self.worker_index
                     request_info.error = "Request was cancelled"
                     request_info.timings.resolve_end = time.time()
                     self._send_update("cancelled", None, node.request, request_info)
@@ -345,7 +350,7 @@ class WorkerProcess(Generic[RequestT, ResponseT]):
             for node_id, node in graph.nodes.items():
                 request_info = graph.request_infos.get(node_id)
                 if request_info is not None:
-                    request_info.scheduler_node_id = self.messaging.worker_index or -1
+                    request_info.scheduler_node_id = self.worker_index
                     request_info.error = "Request was cancelled"
                     request_info.timings.resolve_end = time.time()
                     self._send_update("cancelled", None, node.request, request_info)
@@ -438,7 +443,7 @@ class WorkerProcess(Generic[RequestT, ResponseT]):
                 f"No RequestInfo for node '{node_id}' in graph '{state.graph.graph_id}'"
             )
         request_info.timings.dequeued = time.time()
-        request_info.scheduler_node_id = self.messaging.worker_index or -1
+        request_info.scheduler_node_id = self.worker_index
         request_info.timings.targeted_start = target_start
         self._send_update("pending", None, request, request_info)
         return request, request_info

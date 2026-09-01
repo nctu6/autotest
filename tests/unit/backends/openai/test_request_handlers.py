@@ -25,18 +25,17 @@ from guidellm.backends.openai.request_handlers import (
     TextCompletionsRequestHandler,
     WSEventResult,
 )
-from guidellm.data.finalizers.generative import (
-    GenerativeRequestFinalizer,
-    GenerativeRequestFinalizerArgs,
-)
+from guidellm.data.finalizers.generative import GenerativeRequestFinalizer
+from guidellm.scheduler.schemas.conversation_graph import GenerativeConversationGraph
 from guidellm.schemas import (
     GenerationRequest,
     GenerationRequestArguments,
     GenerationResponse,
+    ToolCall,
+    ToolCallFunction,
     UsageMetrics,
 )
-from guidellm.schemas.conversation_graph import GenerativeConversationGraph
-from guidellm.schemas.tool_call import ToolCall, ToolCallFunction
+from guidellm.schemas.data import GenerativeRequestFinalizerArgs
 from guidellm.settings import settings
 from guidellm.utils.registry import RegistryMixin
 
@@ -3499,6 +3498,29 @@ class TestResponsesRequestHandler:
         assert output_metrics.text_tokens == expected_output_tokens
         assert output_metrics.text_words == (len(text.split()) if text else 0)
         assert output_metrics.text_characters == len(text)
+
+    @pytest.mark.smoke
+    @pytest.mark.parametrize(
+        ("input_tokens_details", "expected_cached_tokens"),
+        [
+            ({"cached_tokens": 8}, 8),
+            ({"cached_tokens": 0}, 0),
+            ({}, None),
+            (None, None),
+        ],
+    )
+    def test_extract_metrics_cached_tokens(
+        self, valid_instances, input_tokens_details, expected_cached_tokens
+    ):
+        """Test extract_metrics captures input_tokens_details.cached_tokens."""
+        usage = {"input_tokens": 10, "output_tokens": 5}
+        if input_tokens_details is not None:
+            usage["input_tokens_details"] = input_tokens_details
+
+        input_metrics, _ = valid_instances.extract_metrics(usage, "Test response")
+
+        assert input_metrics.text_tokens == 10
+        assert input_metrics.cached_tokens == expected_cached_tokens
 
     @pytest.mark.smoke
     @pytest.mark.parametrize(

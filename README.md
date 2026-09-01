@@ -103,6 +103,17 @@ podman run \
   ghcr.io/vllm-project/guidellm:latest
 ```
 
+Published images are multi-arch (`linux/amd64` and `linux/arm64`) for Docker, Podman, Kubernetes, and OpenShift. Prefer pinning a release tag in production:
+
+| Tag       | Meaning                                       |
+| --------- | --------------------------------------------- |
+| `vX.Y.Z`  | Immutable release (multi-arch from `v0.7.0+`) |
+| `stable`  | Newest full release (`vX.Y.Z`)                |
+| `latest`  | Newest release tag (may include pre-releases) |
+| `nightly` | Tip of `main`                                 |
+
+Architecture-specific tags such as `vX.Y.Z-amd64` / `vX.Y.Z-arm64` are build artifacts — do not use them as the image reference.
+
 ### Launch an Inference Server
 
 Start any OpenAI-compatible endpoint. For vLLM:
@@ -157,7 +168,7 @@ This file provides a compact tabular view of each benchmark with the fields most
 
 **benchmarks.html**
 
-The HTML report provides a visual summary of results, including charts of latency distributions, throughput behavior, and generation patterns. It's ideal for quick exploration or sharing with teammates without requiring them to parse JSON.
+A self-contained HTML report with charts and tables for throughput and latency (emphasizing P95/P99). The file embeds its own CSS and JavaScript, so it can be shared without network access or a versioned UI dependency.
 
 ## Common Use Cases and Configurations
 

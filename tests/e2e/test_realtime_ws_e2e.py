@@ -16,11 +16,9 @@ from typing import Any
 import pytest
 from websockets.asyncio.server import serve
 
-from guidellm.backends.openai.websocket import (
-    OpenAIWebSocketBackend,
-    OpenAIWebSocketBackendArgs,
-)
+from guidellm.backends.openai.websocket import OpenAIWebSocketBackend
 from guidellm.schemas import GenerationRequest, RequestInfo, RequestTimings
+from guidellm.schemas.backends import OpenAIWebSocketBackendArgs
 
 
 def make_realtime_transcription_stub_handler(
@@ -89,7 +87,6 @@ def requires_audio_stack():
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(60)
-@pytest.mark.e2e
 async def test_realtime_ws_full_stack_in_one_event_loop(
     requires_audio_stack,
     tmp_path: Path,

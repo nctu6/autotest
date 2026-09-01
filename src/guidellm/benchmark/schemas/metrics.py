@@ -784,6 +784,24 @@ class GenerativeMetrics(StandardBaseDict):
     request_latency: StatusDistributionSummary = Field(
         description="Distribution of request latencies for completed requests"
     )
+    request_dispatch_delay: StatusDistributionSummary | None = Field(
+        default=None,
+        description=(
+            "Distribution of delays between a request's targeted start and the "
+            "time it was dispatched. Grows when the scheduler cannot keep up "
+            "with the configured rate. None when the strategy does not define "
+            "an arrival schedule"
+        ),
+    )
+    request_scheduled_latency: StatusDistributionSummary | None = Field(
+        default=None,
+        description=(
+            "Distribution of request latencies measured from each request's "
+            "targeted start rather than its dispatch, including scheduler "
+            "delay. None when the strategy does not define an arrival "
+            "schedule"
+        ),
+    )
     request_streaming_iterations_count: StatusDistributionSummary = Field(
         description="Distribution of stream iterations for completed requests"
     )
@@ -812,6 +830,18 @@ class GenerativeMetrics(StandardBaseDict):
     )
     inter_token_latency_ms: StatusDistributionSummary = Field(
         description="Distribution of inter-token latencies in milliseconds"
+    )
+    time_to_last_round_trip_ms: StatusDistributionSummary = Field(
+        description=(
+            "Distribution of websocket last-round-trip latencies in milliseconds "
+            "(last received token minus last sent packet)"
+        )
+    )
+    avg_round_trip_time_ms: StatusDistributionSummary = Field(
+        description=(
+            "Distribution of approximate websocket average round-trip times in "
+            "milliseconds (mean received minus mean sent)"
+        )
     )
     prompt_tokens_per_second: StatusDistributionSummary = Field(
         description="Distribution of prompt token processing rates"
@@ -871,6 +901,26 @@ class GenerativeMetrics(StandardBaseDict):
         incomplete = accumulator.incomplete.get_within_range(start_time, end_time)
         errored = accumulator.errored.get_within_range(start_time, end_time)
 
+        # Schedule-relative metrics describe lag against an arrival schedule.
+        # Closed-loop strategies derive each target from the system's own
+        # responses, so a delay measured against them is circular rather than a
+        # coordinated-omission correction, and is reported as None instead.
+        dispatch_delay: StatusDistributionSummary | None = None
+        scheduled_latency: StatusDistributionSummary | None = None
+        if accumulator.config.strategy.defines_arrival_schedule:
+            dispatch_delay = StatusDistributionSummary.from_values_function(
+                function=lambda req: req.request_dispatch_delay,
+                successful=successful,
+                incomplete=incomplete,
+                errored=errored,
+            )
+            scheduled_latency = StatusDistributionSummary.from_values_function(
+                function=lambda req: req.request_scheduled_latency,
+                successful=successful,
+                incomplete=incomplete,
+                errored=errored,
+            )
+
         return GenerativeMetrics(
             # Request stats
             request_totals=StatusBreakdown(
@@ -908,6 +958,8 @@ class GenerativeMetrics(StandardBaseDict):
                 incomplete=incomplete,
                 errored=errored,
             ),
+            request_dispatch_delay=dispatch_delay,
+            request_scheduled_latency=scheduled_latency,
             request_streaming_iterations_count=StatusDistributionSummary.from_values_function(
                 function=lambda req: req.info.timings.request_iterations or 0.0,
                 successful=successful,
@@ -935,6 +987,18 @@ class GenerativeMetrics(StandardBaseDict):
             ),
             time_to_first_token_ms=StatusDistributionSummary.from_values_function(
                 function=lambda req: req.time_to_first_token_ms or 0.0,
+                successful=successful,
+                incomplete=incomplete,
+                errored=errored,
+            ),
+            time_to_last_round_trip_ms=StatusDistributionSummary.from_values_function(
+                function=lambda req: req.time_to_last_round_trip_ms or 0.0,
+                successful=successful,
+                incomplete=incomplete,
+                errored=errored,
+            ),
+            avg_round_trip_time_ms=StatusDistributionSummary.from_values_function(
+                function=lambda req: req.avg_round_trip_time_ms or 0.0,
                 successful=successful,
                 incomplete=incomplete,
                 errored=errored,
