@@ -100,8 +100,8 @@ def extract_model_from_compose(compose_file: Path) -> str:
     m = re.search(r"--model(?:-path)?(?:=|\s+)([^\s\"']+)", content)
     if m:
         return _resolve_env_default(m.group(1))
-    # Try vllm serve <model>
-    m = re.search(r"vllm\s+serve\s+([^\s\"'\\]+)", content)
+    # Try "<engine> serve <model>" (e.g. "vllm serve ...", "tokenspeed serve ...")
+    m = re.search(r"\w+\s+serve\s+([^\s\"'\\]+)", content)
     if m:
         return _resolve_env_default(m.group(1))
     raise RuntimeError(f"Cannot extract model from {compose_file}")
