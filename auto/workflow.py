@@ -18,9 +18,11 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -30,6 +32,118 @@ LOG = logging.getLogger("workflow")
 
 DEFAULT_HEALTH_TIMEOUT_SEC = 36 * 60
 DEFAULT_PORT_FREE_WAIT_SEC = 90
+
+
+# ---------------------------------------------------------------------------
+# Interrupt-safe cleanup
+#
+# On Ctrl+C (SIGINT) or SIGTERM we must (1) stop the in-flight test/guidellm
+# child process and (2) bring down whichever compose service is currently up.
+# We track both in module-level state and tear them down from a single
+# cleanup() path shared by the signal handler and the normal exit finally.
+# ---------------------------------------------------------------------------
+
+_CLEANUP_LOCK = threading.Lock()
+# Compose files that have been brought "up" and not yet "down"ed.
+_ACTIVE_COMPOSE_FILES: set[Path] = set()
+# The currently running test/guidellm child process, if any.
+_ACTIVE_CHILD: subprocess.Popen | None = None
+_INTERRUPTED = False
+# When --nostop is set, interrupt cleanup stops guidellm but leaves containers up.
+_NOSTOP = False
+
+
+def set_nostop(value: bool) -> None:
+    global _NOSTOP
+    _NOSTOP = value
+
+
+def _register_active_compose(compose_file: Path) -> None:
+    with _CLEANUP_LOCK:
+        _ACTIVE_COMPOSE_FILES.add(compose_file)
+
+
+def _unregister_active_compose(compose_file: Path) -> None:
+    with _CLEANUP_LOCK:
+        _ACTIVE_COMPOSE_FILES.discard(compose_file)
+
+
+def _set_active_child(proc: subprocess.Popen | None) -> None:
+    global _ACTIVE_CHILD
+    with _CLEANUP_LOCK:
+        _ACTIVE_CHILD = proc
+
+
+def _terminate_active_child() -> None:
+    """Stop the in-flight test/guidellm child process (and its group)."""
+    with _CLEANUP_LOCK:
+        proc = _ACTIVE_CHILD
+    if proc is None or proc.poll() is not None:
+        return
+    LOG.info("[cleanup] stopping test/guidellm child process (pid=%s)", proc.pid)
+    try:
+        # The child was started in its own process group so we can signal the
+        # whole tree (bash test script + guidellm) at once.
+        os.killpg(proc.pid, signal.SIGINT)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        LOG.warning("[cleanup] child did not exit, sending SIGKILL")
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+
+
+def cleanup(reason: str = "") -> None:
+    """Stop the active child process and bring down any running compose services.
+
+    In ``--nostop`` mode the in-flight guidellm child is still stopped, but
+    running containers are left up (the user opted to keep them alive).
+    """
+    _terminate_active_child()
+    if _NOSTOP:
+        with _CLEANUP_LOCK:
+            active = sorted(f.name for f in _ACTIVE_COMPOSE_FILES)
+        if active:
+            LOG.info(
+                "[cleanup] --nostop: leaving container(s) up: %s",
+                ", ".join(active),
+            )
+        return
+    with _CLEANUP_LOCK:
+        compose_files = sorted(_ACTIVE_COMPOSE_FILES)
+    for compose_file in compose_files:
+        if reason:
+            LOG.info("[cleanup] compose down %s (%s)", compose_file.name, reason)
+        try:
+            compose_down(compose_file)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not raise
+            LOG.warning("[cleanup] compose down failed for %s: %s",
+                        compose_file.name, exc)
+        finally:
+            _unregister_active_compose(compose_file)
+
+
+def _handle_interrupt(signum, _frame) -> None:
+    global _INTERRUPTED
+    if _INTERRUPTED:
+        return  # already tearing down; ignore repeated signals
+    _INTERRUPTED = True
+    LOG.warning("[interrupt] received signal %s — cleaning up...", signum)
+    cleanup(reason=f"signal {signum}")
+    # Re-raise as KeyboardInterrupt so main()'s finally/return path runs.
+    raise KeyboardInterrupt
+
+
+def install_signal_handlers() -> None:
+    signal.signal(signal.SIGINT, _handle_interrupt)
+    signal.signal(signal.SIGTERM, _handle_interrupt)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +249,9 @@ def compose_up(compose_file: Path) -> None:
     name = compose_file.name
     cmd = ["docker", "compose", "-f", name, "up", "-d"]
     LOG.info("[compose-up] %s", " ".join(cmd))
+    # Register before starting so an interrupt mid-startup still triggers a
+    # teardown of the (possibly partially) started service.
+    _register_active_compose(compose_file)
     run_cmd(cmd, cwd=cwd)
 
 
@@ -144,6 +261,7 @@ def compose_down(compose_file: Path) -> None:
     cmd = ["docker", "compose", "-f", name, "down"]
     LOG.info("[compose-down] %s", " ".join(cmd))
     run_cmd(cmd, cwd=cwd, check=False)
+    _unregister_active_compose(compose_file)
 
 
 # ---------------------------------------------------------------------------
@@ -208,15 +326,24 @@ def run_test(
         output_dir,
     )
 
-    # Run test script with output forwarded to screen (stdout/stderr passthrough)
-    result = subprocess.run(
+    # Run test script with output forwarded to screen (stdout/stderr passthrough).
+    # start_new_session=True puts the bash test script + its guidellm child in
+    # their own process group, so an interrupt can signal the whole tree at once
+    # (see _terminate_active_child) instead of leaking a running guidellm.
+    proc = subprocess.Popen(
         ["bash", "--norc", "--noprofile", str(test_script)],
         cwd=str(test_script.parent),
         env=env,
+        start_new_session=True,
     )
-    if result.returncode != 0:
+    _set_active_child(proc)
+    try:
+        returncode = proc.wait()
+    finally:
+        _set_active_child(None)
+    if returncode != 0:
         raise RuntimeError(
-            f"Test {test_script.name} failed with exit code {result.returncode}"
+            f"Test {test_script.name} failed with exit code {returncode}"
         )
 
 
@@ -334,6 +461,9 @@ Config format (--config):
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+
+    set_nostop(args.nostop)
+    install_signal_handlers()
 
     output_dir: Path = args.output.resolve()
     concurrency_values = parse_concurrency(args.concurrency) if args.concurrency else None
@@ -609,4 +739,13 @@ Config format (--config):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        exit_code = main()
+    except KeyboardInterrupt:
+        LOG.warning("[interrupt] workflow aborted by user")
+        exit_code = 130  # conventional exit code for SIGINT
+    finally:
+        # Final safety net: ensure nothing is left running regardless of how
+        # main() exited. cleanup() is idempotent.
+        cleanup(reason="shutdown")
+    sys.exit(exit_code)

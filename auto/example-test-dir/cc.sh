@@ -105,12 +105,27 @@ SAMPLES=${SAMPLES:-100}
 TRUNCATE_IN_TOKENS=${TRUNCATE_IN_TOKENS:-25000}
 #
 # MIN_IN_TOKENS / MAX_IN_TOKENS: per-request range FILTER (drops requests outside
-#   the window), evaluated on the ORIGINAL `in` before truncation. Defaults select
-#   the 50K-100K bucket. Filtering runs FIRST, then survivors are truncated to
-#   TRUNCATE_IN_TOKENS. So the effective pipeline is:
-#     keep requests with 50000 <= in <= 100000, then clamp each to 25000 tokens.
-MIN_IN_TOKENS=${MIN_IN_TOKENS:-50000}
-MAX_IN_TOKENS=${MAX_IN_TOKENS:-100000}
+#   the window), evaluated on the ORIGINAL `in` before truncation. Filtering runs
+#   FIRST, then survivors are truncated to TRUNCATE_IN_TOKENS.
+#
+#   For a uniform ~25K-prompt throughput test we want every request to end up at
+#   ~25K tokens, so we keep only requests whose ORIGINAL `in` is already >= the
+#   truncation target (otherwise truncation is a no-op and the prompt stays small,
+#   diluting the "~25K" target). Default floor = TRUNCATE_IN_TOKENS, no upper bound.
+#   Set both empty to keep every request regardless of size.
+MIN_IN_TOKENS=${MIN_IN_TOKENS:-${TRUNCATE_IN_TOKENS}}
+MAX_IN_TOKENS=${MAX_IN_TOKENS:-}
+#
+# FLATTEN_TURNS: in throughput mode we want each REQUEST to be an independent
+#   single-turn ~25K prompt so nothing accumulates across turns and load scales
+#   purely with CONCURRENCY. The weka loader replays each trace row as a chained
+#   MULTI-TURN conversation (turn N sees turns 0..N-1 in its context), which is
+#   what pushes late turns past the server context window (the 400 Bad Request
+#   errors). With FLATTEN_TURNS=1 (default) every surviving turn is emitted as its
+#   own one-turn conversation, giving a flat pool of uniform single-turn requests.
+#   Set FLATTEN_TURNS=0 to preserve original multi-turn conversations.
+#   Ignored in replay mode (replay needs the real multi-turn timing/structure).
+FLATTEN_TURNS=${FLATTEN_TURNS:-1}
 
 # In replay mode, CONCURRENCY is meaningless (load is driven by time_scale), so
 # tag the output files by time_scale instead to avoid collisions when sweeping it.
@@ -148,19 +163,24 @@ fi
 # version tag (PREP_VERSION): bump it whenever the preprocessing logic changes so
 # stale cached files from an older version are not silently reused. We also
 # regenerate whenever the raw download is newer than the processed file.
-PREP_VERSION="v5"
+PREP_VERSION="v6"
 
-# The input filter/truncation only apply outside replay mode.
+# The input filter/truncation/flattening only apply outside replay mode.
 EFF_MIN_IN="${MIN_IN_TOKENS}"
 EFF_MAX_IN="${MAX_IN_TOKENS}"
 EFF_TRUNC="${TRUNCATE_IN_TOKENS}"
+EFF_FLATTEN="${FLATTEN_TURNS}"
 if [ "${MODE}" = "replay" ]; then
   if [ -n "${MIN_IN_TOKENS}${MAX_IN_TOKENS}${TRUNCATE_IN_TOKENS}" ]; then
     echo "[cc.sh] NOTE: MIN_IN_TOKENS/MAX_IN_TOKENS/TRUNCATE_IN_TOKENS ignored in replay mode" >&2
   fi
+  if [ "${FLATTEN_TURNS}" = "1" ]; then
+    echo "[cc.sh] NOTE: FLATTEN_TURNS ignored in replay mode (multi-turn structure preserved)" >&2
+  fi
   EFF_MIN_IN=""
   EFF_MAX_IN=""
   EFF_TRUNC=""
+  EFF_FLATTEN="0"
 fi
 
 TRACE_PATH="${RAW_TRACE_PATH}"
@@ -174,11 +194,37 @@ if [ "${KEEP_SUBAGENTS:-0}" != "1" ]; then
   if [ -n "${EFF_TRUNC}" ]; then
     RANGE_TAG="${RANGE_TAG}.trunc${EFF_TRUNC}"
   fi
-  FILTERED_TRACE_PATH="${RAW_TRACE_PATH%.jsonl}.main-only.${PREP_VERSION}.${RANGE_TAG}.jsonl"
-  if [ ! -s "${FILTERED_TRACE_PATH}" ] || [ "${RAW_TRACE_PATH}" -nt "${FILTERED_TRACE_PATH}" ]; then
+  if [ "${EFF_FLATTEN}" = "1" ]; then
+    RANGE_TAG="${RANGE_TAG}.flat"
+  fi
+
+  # Cache the processed file in a stable, writable directory (default: next to
+  # this script under .cc_cache) instead of inside the read-only-ish HuggingFace
+  # snapshot dir. Override with PREP_CACHE_DIR.
+  PREP_CACHE_DIR="${PREP_CACHE_DIR:-$(dirname "$0")/.cc_cache}"
+  mkdir -p "${PREP_CACHE_DIR}" 2>/dev/null || true
+
+  # Derive a stable identity for the raw trace from its resolved content
+  # signature (size + mtime of the real blob), NOT a live mtime comparison.
+  # Embedding it in the cache filename means: same raw file + same params ->
+  # same cache name -> reuse; a changed raw download -> new name -> regenerate.
+  RAW_SIG="$(python3 -c "
+import os, sys
+p = os.path.realpath(sys.argv[1])
+st = os.stat(p)
+print(f'{st.st_size}-{int(st.st_mtime)}')
+" "${RAW_TRACE_PATH}" 2>/dev/null || echo "nosig")"
+
+  RAW_STEM="$(basename "${RAW_TRACE_PATH%.jsonl}")"
+  FILTERED_TRACE_PATH="${PREP_CACHE_DIR}/${RAW_STEM}.main-only.${PREP_VERSION}.${RANGE_TAG}.${RAW_SIG}.jsonl"
+  if [ -s "${FILTERED_TRACE_PATH}" ]; then
+    echo "[cc.sh] reusing cached preprocessed trace: ${FILTERED_TRACE_PATH}" >&2
+  fi
+  if [ ! -s "${FILTERED_TRACE_PATH}" ]; then
     TS_COL="${TIMESTAMP_COLUMN:-t}" IN_COL="${PROMPT_TOKENS_COLUMN:-in}" \
     OUT_COL="${OUTPUT_TOKENS_COLUMN:-out}" HASH_COL="${HASH_IDS_COLUMN:-hash_ids}" \
     MIN_IN="${EFF_MIN_IN}" MAX_IN="${EFF_MAX_IN}" TRUNC_IN="${EFF_TRUNC}" \
+    FLATTEN="${EFF_FLATTEN}" \
     BLOCK_SIZE="${HASH_ID_BLOCK_SIZE:-64}" \
     python3 -c "
 import json, math, os, sys
@@ -188,8 +234,9 @@ keep = (ts, tin, tout, thash)
 min_in = int(os.environ['MIN_IN']) if os.environ.get('MIN_IN') else None
 max_in = int(os.environ['MAX_IN']) if os.environ.get('MAX_IN') else None
 trunc = int(os.environ['TRUNC_IN']) if os.environ.get('TRUNC_IN') else None
+flatten = os.environ.get('FLATTEN') == '1'
 block = int(os.environ['BLOCK_SIZE'])
-kept_rows = dropped_sub = dropped_range = truncated = 0
+kept_rows = dropped_sub = dropped_range = truncated = emitted_reqs = 0
 with open(src) as fin, open(dst, 'w') as fout:
     for line in fin:
         line = line.strip()
@@ -208,8 +255,8 @@ with open(src) as fin, open(dst, 'w') as fout:
                 dropped_range += 1
                 continue
             rec = {k: d[k] for k in keep}
-            # Truncate: clamp `in` to trunc tokens and keep the first
-            # ceil(trunc/block) hash_ids so the synthesized prompt matches.
+            # Truncate: clamp the in-token count to trunc tokens and keep the
+            # first ceil(trunc/block) hash_ids so the synthesized prompt matches.
             if trunc is not None and rec[tin] > trunc:
                 rec[tin] = trunc
                 n_blocks = math.ceil(trunc / block)
@@ -218,11 +265,26 @@ with open(src) as fin, open(dst, 'w') as fout:
             slimmed.append(rec)
         if not slimmed:
             continue
-        row['requests'] = slimmed
-        fout.write(json.dumps(row) + '\n')
-        kept_rows += 1
+        if flatten:
+            # Emit each surviving turn as its own single-turn conversation so the
+            # weka loader replays it as an independent request (no multi-turn
+            # context accumulation). Give each a unique conversation id.
+            base_id = row.get('id', f'conv{kept_rows}')
+            for i, rec in enumerate(slimmed):
+                out_row = dict(row)
+                out_row['id'] = f'{base_id}.t{i}'
+                out_row['requests'] = [rec]
+                fout.write(json.dumps(out_row) + '\n')
+                emitted_reqs += 1
+            kept_rows += 1
+        else:
+            row['requests'] = slimmed
+            fout.write(json.dumps(row) + '\n')
+            emitted_reqs += len(slimmed)
+            kept_rows += 1
 window = f'[{min_in if min_in is not None else 0}, {max_in if max_in is not None else \"inf\"}]'
-print(f'[cc.sh] preprocessed trace: kept {kept_rows} conversations, dropped {dropped_sub} subagent + {dropped_range} out-of-range, truncated {truncated} requests to {trunc if trunc is not None else \"-\"} tokens, in-window {window}', file=sys.stderr)
+mode = 'flattened single-turn' if flatten else 'multi-turn'
+print(f'[cc.sh] preprocessed trace ({mode}): kept {kept_rows} conversations / {emitted_reqs} requests, dropped {dropped_sub} subagent + {dropped_range} out-of-range, truncated {truncated} requests to {trunc if trunc is not None else \"-\"} tokens, in-window {window}', file=sys.stderr)
 if kept_rows == 0:
     print('[cc.sh] ERROR: no conversations left after filtering (check MIN_IN_TOKENS/MAX_IN_TOKENS)', file=sys.stderr)
     sys.exit(1)
@@ -257,7 +319,7 @@ guidellm run \
   --backend "kind=openai_http,target=http://${HOST}:${PORT},model=${SERVED_MODEL},request_format=/v1/chat/completions,timeout=${REQUEST_TIMEOUT}" \
   "${PROFILE_ARGS[@]}" \
   --tokenizer "{\"kind\":\"huggingface_auto\",\"model\":\"${MODEL}\",\"load_kwargs\":{\"use_fast\":false}}" \
-  --data "{\"kind\":\"weka\",\"path\":\"${TRACE_PATH}\"}" \
+  --data "{\"kind\":\"weka\",\"path\":\"${TRACE_PATH}\",\"validate\":${WEKA_VALIDATE:-false}}" \
   --data-loader "kind=pytorch,samples=${SAMPLES}" \
   --output "kind=json,path=${OUTPUT_DIR}/${OUT_BASE}.json" \
   --output "kind=csv,path=${OUTPUT_DIR}/${OUT_BASE}.csv" \

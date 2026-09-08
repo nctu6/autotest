@@ -36,3 +36,13 @@ class TraceDataArgs(DataArgs):
             "with conversation-scoped trace data such as hash IDs."
         ),
     )
+    validate: bool = Field(
+        default=True,
+        description=(
+            "Whether to run the per-conversation type/None validation pass "
+            "(a datasets .cast over every conversation). This is a correctness "
+            "check for untrusted trace files; it can be expensive on large "
+            "traces and re-runs on every invocation. Set to false to skip it "
+            "for a pre-validated / trusted trace file."
+        ),
+    )

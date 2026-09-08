@@ -411,5 +411,6 @@ class TraceDatasetDeserializer(DatasetDeserializer):
         dataset = dataset.map(_deserialize_nested_data, batched=True)
         trace_format = TraceFormatRegistry.dispatch(config, dataset)
         _handle_column_search(config, trace_format)
-        _validate_dataset(config, trace_format)
+        if config.validate:
+            _validate_dataset(config, trace_format)
         return TraceDataset(config, trace_format, processor_factory(), random_seed)
