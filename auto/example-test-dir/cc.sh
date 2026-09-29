@@ -50,24 +50,31 @@
 #   done
 #
 # Environment variables injected by workflow.py:
-#   PORT         - server port
-#   MODEL        - model path (tokenizer)
-#   CONCURRENCY  - current concurrency level (drives load in throughput mode)
-#   OUTPUT_DIR   - output directory for results
-#   SERVICE_NAME - compose file stem
-#   TEST_NAME    - test script stem
-#   TP           - tensor parallel size
+#   PORT          - server port
+#   MODEL         - model/tokenizer path (host path after compose volume remap)
+#   TOKENIZER     - optional tokenizer override (defaults to MODEL)
+#   SERVED_MODEL  - API model name (from --served-model-name / compose env)
+#   CONCURRENCY   - current concurrency level (drives load in throughput mode)
+#   COUNT         - number of requests (CONCURRENCY * 10)
+#   OUTPUT_DIR    - output directory for results
+#   OUTPUT_PREFIX - filename prefix from workflow pair dirs
+#   SERVICE_NAME  - compose file stem
+#   TEST_NAME     - test script stem
+#   TP            - tensor parallel size
+#   RUN_TAG       - filename suffix (e.g. "c32" or "ts1.0" in replay mode)
+#   HOST          - server host (default 127.0.0.1)
 
-HOST=127.0.0.1
+HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8976}
 MODEL=${MODEL:-/models/Qwen/Qwen3.5-27B}
+TOKENIZER=${TOKENIZER:-${MODEL}}
 CONCURRENCY=${CONCURRENCY:-1}
 COUNT=${COUNT:-$((CONCURRENCY * 10))}
 OUTPUT_DIR=${OUTPUT_DIR:-./results}
 SERVICE_NAME=${SERVICE_NAME:-cc}
 TEST_NAME=${TEST_NAME:-cc}
 TP=${TP:-1}
-SERVED_MODEL=${SERVED_MODEL:-test}
+SERVED_MODEL=${SERVED_MODEL:-${SERVICE_NAME:-test}}
 RUN_TAG=${RUN_TAG:-c${CONCURRENCY}}
 OUTPUT_PREFIX=${OUTPUT_PREFIX:-}
 
@@ -318,7 +325,7 @@ fi
 guidellm run \
   --backend "kind=openai_http,target=http://${HOST}:${PORT},model=${SERVED_MODEL},request_format=/v1/chat/completions,timeout=${REQUEST_TIMEOUT}" \
   "${PROFILE_ARGS[@]}" \
-  --tokenizer "{\"kind\":\"huggingface_auto\",\"model\":\"${MODEL}\",\"load_kwargs\":{\"use_fast\":false}}" \
+  --tokenizer "{\"kind\":\"huggingface_auto\",\"model\":\"${TOKENIZER}\",\"load_kwargs\":{\"use_fast\":false}}" \
   --data "{\"kind\":\"weka\",\"path\":\"${TRACE_PATH}\",\"validate\":${WEKA_VALIDATE:-false}}" \
   --data-loader "kind=pytorch,samples=${SAMPLES}" \
   --output "kind=json,path=${OUTPUT_DIR}/${OUT_BASE}.json" \

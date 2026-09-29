@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """GuideLLM autotest workflow.
 
-Loops over service configs (docker-compose files) and test configs (shell scripts),
-running each test at each concurrency level.
+Default (non-nostop): concurrency outer, then service configs, then test scripts
+(up → health → run_test → down per test). With --nostop: service outer, keep
+container up across concurrency levels for each test.
 
 Usage:
     python3 workflow.py \
@@ -204,26 +205,51 @@ def extract_port_from_compose(compose_file: Path) -> int:
     match = re.search(r'--port\s+(\d+)', content)
     if match:
         return int(match.group(1))
+    # Host-network / env-driven ports (no ports: mapping), e.g. VLLM_PORT: "8976"
+    match = re.search(
+        r'(?m)^\s*(?:VLLM_PORT|HOST_PORT|PORT):\s*["\']?(\d+)["\']?\s*$',
+        content,
+    )
+    if match:
+        return int(match.group(1))
     raise RuntimeError(f"Cannot extract port from {compose_file}")
 
 
 def extract_model_from_compose(compose_file: Path) -> str:
     """Extract model path from a docker-compose yml file."""
     content = compose_file.read_text(encoding="utf-8")
-    # Try --model flag
-    m = re.search(r"--model(?:-path)?(?:=|\s+)([^\s\"']+)", content)
+    model: str | None = None
+    # Try --model / --model-path / GGUF-style -m
+    m = re.search(r"(?:--model(?:-path)?|-m)(?:=|\s+)([^\s\"']+)", content)
     if m:
-        return _resolve_env_default(m.group(1))
-    # Try "<engine> serve <model>" (e.g. "vllm serve ...", "tokenspeed serve ...")
-    m = re.search(r"\w+\s+serve\s+([^\s\"'\\]+)", content)
-    if m:
-        return _resolve_env_default(m.group(1))
-    raise RuntimeError(f"Cannot extract model from {compose_file}")
+        model = _resolve_env_default(m.group(1))
+    if not model:
+        # Try "<engine> serve <model>" (e.g. "vllm serve ...", "tokenspeed serve ...")
+        m = re.search(r"\w+\s+serve\s+([^\s\"'\\]+)", content)
+        if m:
+            model = _resolve_env_default(m.group(1))
+    if not model:
+        # Host-network / env-driven model path, e.g. MODEL_PATH: /models
+        m = re.search(
+            r'(?m)^\s*(?:MODEL_PATH|MODEL_DIR|MODEL|TOKENIZER):\s*["\']?([^"\'\s]+)["\']?\s*$',
+            content,
+        )
+        if m:
+            model = _resolve_env_default(m.group(1))
+    if not model:
+        raise RuntimeError(f"Cannot extract model from {compose_file}")
+    return _remap_model_via_volumes(model, content)
 
 
 def extract_served_model_name(compose_file: Path) -> str | None:
     content = compose_file.read_text(encoding="utf-8")
-    m = re.search(r"--served-model-name(?:=|\s+)([^\s\"']+)", content)
+    m = re.search(r"(?:--served-model-name|--alias)(?:=|\s+)([^\s\"']+)", content)
+    if m:
+        return _resolve_env_default(m.group(1))
+    m = re.search(
+        r'(?m)^\s*(?:SERVED_MODEL_NAME|MODEL_NAME):\s*["\']?([^"\'\s]+)["\']?\s*$',
+        content,
+    )
     return _resolve_env_default(m.group(1)) if m else None
 
 
@@ -231,6 +257,12 @@ def extract_tp_from_compose(compose_file: Path) -> str:
     """Extract tensor-parallel-size from a docker-compose yml file."""
     content = compose_file.read_text(encoding="utf-8")
     m = re.search(r"--tensor-parallel-size(?:=|\s+)([^\s\"']+)", content)
+    if m:
+        return _resolve_env_default(m.group(1))
+    m = re.search(
+        r'(?m)^\s*(?:TP_SIZE|TENSOR_PARALLEL|TENSOR_PARALLEL_SIZE):\s*["\']?([^"\'\s]+)["\']?\s*$',
+        content,
+    )
     if m:
         return _resolve_env_default(m.group(1))
     return "1"
@@ -242,6 +274,22 @@ def _resolve_env_default(value: str) -> str:
     if m:
         return m.group(1)
     return value
+
+
+def _remap_model_via_volumes(model: str, compose_text: str) -> str:
+    """Map a container model path to the host bind-mount source when possible."""
+    if not model:
+        return model
+    # Paths must not span whitespace/newlines or a bind without :mode eats the next line.
+    vol_re = r'(?m)^\s*-\s*["\']?([^\s:"\']+):([^\s:"\']+)(?::[^\s"\']*)?["\']?\s*$'
+    for match in re.finditer(vol_re, compose_text):
+        source, target = match.group(1).strip(), match.group(2).strip()
+        if not source.startswith(("./", "../", "/")):
+            continue
+        if model == target or model.startswith(target.rstrip("/") + "/"):
+            suffix = model[len(target):] if model.startswith(target) else ""
+            return f"{source}{suffix}"
+    return model
 
 
 def compose_up(compose_file: Path) -> None:
@@ -665,25 +713,30 @@ Config format (--config):
 
                     compose_down(svc_file)
         else:
-            for svc_file in service_files:
+            # Default path: concurrency outer → services → tests
+            # (bring service up/down for each test at each concurrency).
+            for conc in (concurrency_values or [None]):
                 LOG.info("=" * 60)
-                LOG.info("[service] %s", svc_file.name)
+                LOG.info("[concurrency] c=%s", conc)
 
-                try:
-                    port = extract_port_from_compose(svc_file)
-                    model = extract_model_from_compose(svc_file)
-                    tp = extract_tp_from_compose(svc_file)
-                    served_model = extract_served_model_name(svc_file)
-                except Exception as exc:
-                    failures.append(f"{svc_file.name}: parse error: {exc}")
-                    LOG.exception("[error] %s", exc)
-                    continue
+                for svc_file in service_files:
+                    LOG.info("=" * 60)
+                    LOG.info("[service] %s", svc_file.name)
 
-                for test_file in test_files:
-                    LOG.info("-" * 40)
-                    LOG.info("[test] %s on %s", test_file.name, svc_file.name)
+                    try:
+                        port = extract_port_from_compose(svc_file)
+                        model = extract_model_from_compose(svc_file)
+                        tp = extract_tp_from_compose(svc_file)
+                        served_model = extract_served_model_name(svc_file)
+                    except Exception as exc:
+                        failures.append(f"{svc_file.name}: parse error: {exc}")
+                        LOG.exception("[error] %s", exc)
+                        continue
 
-                    for conc in (concurrency_values or [None]):
+                    for test_file in test_files:
+                        LOG.info("-" * 40)
+                        LOG.info("[test] %s on %s", test_file.name, svc_file.name)
+
                         if result_exists(output_dir, svc_file.stem, tp, test_file.stem, conc, output_prefix):
                             LOG.info("[skip] %s/%s c=%s — results already exist",
                                      svc_file.name, test_file.name, conc)

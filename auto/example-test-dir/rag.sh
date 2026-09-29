@@ -1,26 +1,31 @@
 #!/bin/bash
 # RAG benchmark test config for guidellm autotest
 # Environment variables injected by workflow.py:
-#   PORT         - server port
-#   MODEL        - model path
-#   CONCURRENCY  - current concurrency level (optional, test decides if not set)
-#   COUNT        - number of requests (CONCURRENCY * 10, optional)
-#   OUTPUT_DIR   - output directory for results
-#   SERVICE_NAME - compose file stem
-#   TEST_NAME    - test script stem
-#   TP           - tensor parallel size
-#   RUN_TAG      - filename suffix (e.g. "c32" or "" if concurrency not set by workflow)
+#   PORT          - server port
+#   MODEL         - model/tokenizer path (host path after compose volume remap)
+#   TOKENIZER     - optional tokenizer override (defaults to MODEL)
+#   SERVED_MODEL  - API model name (from --served-model-name / compose env)
+#   CONCURRENCY   - current concurrency level (optional, test decides if not set)
+#   COUNT         - number of requests (CONCURRENCY * 10, optional)
+#   OUTPUT_DIR    - output directory for results
+#   OUTPUT_PREFIX - filename prefix from workflow pair dirs
+#   SERVICE_NAME  - compose file stem
+#   TEST_NAME     - test script stem
+#   TP            - tensor parallel size
+#   RUN_TAG       - filename suffix (e.g. "c32" or "" if concurrency not set by workflow)
+#   HOST          - server host (default 127.0.0.1)
 
-HOST=127.0.0.1
+HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-8976}
 MODEL=${MODEL:-/models/Qwen/Qwen3.5-9B}
+TOKENIZER=${TOKENIZER:-${MODEL}}
 CONCURRENCY=${CONCURRENCY:-1}
 COUNT=${COUNT:-$((CONCURRENCY * 10))}
 OUTPUT_DIR=${OUTPUT_DIR:-./results}
 SERVICE_NAME=${SERVICE_NAME:-unknown}
 TEST_NAME=${TEST_NAME:-rag}
 TP=${TP:-1}
-SERVED_MODEL=${SERVED_MODEL:-test}
+SERVED_MODEL=${SERVED_MODEL:-${SERVICE_NAME:-test}}
 RUN_TAG=${RUN_TAG:-c${CONCURRENCY}}
 OUTPUT_PREFIX=${OUTPUT_PREFIX:-}
 
@@ -31,7 +36,7 @@ guidellm run \
   --backend "kind=openai_http,target=http://${HOST}:${PORT},model=${SERVED_MODEL}" \
   --profile "kind=throughput,max_concurrency=${CONCURRENCY}" \
   --constraint "kind=max_requests,count=${COUNT}" \
-  --tokenizer "{\"kind\":\"huggingface_auto\",\"model\":\"${MODEL}\",\"load_kwargs\":{\"use_fast\":false}}" \
+  --tokenizer "{\"kind\":\"huggingface_auto\",\"model\":\"${TOKENIZER}\",\"load_kwargs\":{\"use_fast\":false}}" \
   --data '{"kind":"huggingface","source":"neural-bridge/rag-dataset-12000","load_kwargs":{"split":"train"}}' \
   --data-column-mapper '{"kind":"generative_column_mapper","column_mappings":{"text_column":["context","question"]}}' \
   --output "kind=json,path=${OUTPUT_DIR}/${OUT_BASE}.json" \

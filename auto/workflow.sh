@@ -6,6 +6,10 @@
 #   bash auto/workflow.sh --nostop                # keep container alive across concurrency
 #   bash auto/workflow.sh --concurrency 1,32,128  # loop concurrency (test uses $CONCURRENCY)
 #
+# Loop order (default / non-nostop): concurrency → services → tests
+#   (up/health/run/down per test). With --nostop: service → test → concurrency
+#   (container kept up across concurrency levels for each test).
+#
 # Options (pass via "$@"):
 #   --config          Pairs of (service_dir,test_dir), one per line or semicolon-separated
 #   --concurrency     Comma-separated concurrency values. If not set, loop once and
@@ -38,7 +42,7 @@
 #   # No --concurrency (test script decides, loop once per test):
 #   python3 auto/workflow.py --config "/svc,/tests" --nostop
 #
-#   # With --concurrency (workflow loops each value):
+#   # With --concurrency (default: concurrency outer, then each service/test):
 #   python3 auto/workflow.py --config "/svc,/tests" --concurrency 1,16,32,64
 #
 #   # Semicolon-separated single-line:
