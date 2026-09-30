@@ -13,6 +13,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
+LOG_FILE="$ROOT_DIR/optuna.log"
+exec > >(tee "$LOG_FILE") 2>&1
+echo "[optuna] Logging to $LOG_FILE"
+
 if [ -f "$ROOT_DIR/.venv/bin/activate" ]; then
     # shellcheck source=/dev/null
     source "$ROOT_DIR/.venv/bin/activate"

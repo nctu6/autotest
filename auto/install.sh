@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$ROOT_DIR"
 
+LOG_FILE="$ROOT_DIR/install.log"
+exec > >(tee "$LOG_FILE") 2>&1
+echo "[install] Logging to $LOG_FILE"
+
 echo "[install] Creating Python virtual environment in $ROOT_DIR/.venv ..."
 python3 -m venv .venv
 

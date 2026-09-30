@@ -64,6 +64,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
+LOG_FILE="$ROOT_DIR/workflow.log"
+exec > >(tee "$LOG_FILE") 2>&1
+echo "[workflow] Logging to $LOG_FILE"
+
 # Activate venv if available
 if [ -f "$ROOT_DIR/.venv/bin/activate" ]; then
     source "$ROOT_DIR/.venv/bin/activate"
