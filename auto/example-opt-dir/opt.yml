@@ -1,0 +1,48 @@
+# Simplified Optuna config — optimize server CLI args, not env vars.
+#
+# Idea (deliberately NOT old UnieConfig / env injection):
+#   Each trial: parse base compose as YAML → rewrite service `command`
+#   tokens from `args` → dump temp compose under output/trial_N/ →
+#   up → health → one test → score → down.
+#   Base compose files stay literal (no ${VAR} required for tunable params).
+#   No Hydra, no parameter-type DSL, no env override for the search space.
+#
+# Run (from repo root; relative paths below are vs CWD):
+#   bash auto/optuna.sh
+#   bash auto/optuna.sh ./auto/example-opt-dir/opt.yml
+#   python3 auto/export.py --optuna ./auto/example-opt-dir/opt.yml
+#
+# Absolute paths are also fine. No hidden auto/ prefixing in the runner.
+#
+# Grid size: n_trials is UNUSED. The runner auto-computes the full
+# combinatorial grid as product(len(choices)) over every key under args,
+# then runs Optuna GridSampler over all combinations. A leftover
+# n_trials key in older configs is ignored (logged).
+# n_trials: 1   # unused — auto full grid from args
+
+direction: maximize   # maximize | minimize
+
+# Single compose + single test keeps one trial = one fair run
+compose: ./auto/example-service-dir/docker-compose.yml
+test: ./auto/example-test-dir/rag.sh
+concurrency: 16
+health_timeout: 2160
+output: ./auto/results/optuna
+
+# Guidellm CSV key (same naming as export.py)
+metric: "Token Throughput / Output Tokens/Sec"
+
+# Search space: vLLM / server CLI arguments (without leading --).
+# Values are categorical choices. Full grid = product of list lengths;
+# GridSampler enumerates every combination. The runner mutates the YAML
+# command token list:
+#   bool true  → ensure `--name` present (switch, no value)
+#   bool false → remove `--name` (and a following value if present)
+#   other      → set `--name <value>` (replace existing or append)
+# Schema stays flat under `args` only (no flags key).
+args:
+  max-num-seqs: [128, 452]
+  max-num-batched-tokens: [4096, 8192]
+  gpu-memory-utilization: [0.90, 0.95]
+  # Boolean switches use YAML booleans: true adds `--name`, false removes it.
+  enable-prefix-caching: [true, false]

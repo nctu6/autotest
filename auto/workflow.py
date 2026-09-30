@@ -10,13 +10,19 @@ Usage:
         --service-dir ./example-service-dir \
         --test-dir ./example-test-dir \
         --concurrency 1,16,32,64,128,256,512
+
+    # Optuna server-arg search (see example-opt-dir/opt.yml):
+    python3 workflow.py --optuna ./example-opt-dir/opt.yml
+    # or: ./optuna.sh ./example-opt-dir/opt.yml
+
+Path rule for --optuna YAML and paths inside it: relative paths resolve
+against the process CWD (run from auto/ so ./results/... lands under auto/).
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import os
-import re
 import shlex
 import shutil
 import signal
@@ -28,6 +34,17 @@ import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+# Compose extract helpers live in compose_util; re-exported here for
+# ``import workflow as wf`` / ``wf.extract_*`` callers.
+from compose_util import (  # noqa: F401
+    _remap_model_via_volumes,
+    _resolve_env_default,
+    extract_model_from_compose,
+    extract_port_from_compose,
+    extract_served_model_name,
+    extract_tp_from_compose,
+)
 
 LOG = logging.getLogger("workflow")
 
@@ -187,112 +204,10 @@ def wait_for_health(url: str, timeout_sec: int, interval_sec: int = 6) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Compose file helpers
+# Compose file helpers (implementations in compose_util; imported above)
 # ---------------------------------------------------------------------------
 
-def extract_port_from_compose(compose_file: Path) -> int:
-    """Extract host port from a docker-compose yml file."""
-    content = compose_file.read_text(encoding="utf-8")
-    # Match literal port: - "8976:8976" or - 8976:8976
-    match = re.search(r'(?m)^\s*-\s*"?(\d+):\d+(?:/\w+)?"?\s*$', content)
-    if match:
-        return int(match.group(1))
-    # Match env var with default: - "${HOST_PORT:-8976}:8976"
-    match = re.search(r'(?m)^\s*-\s*"?\$\{[^:}]+:-(\d+)\}:\d+(?:/\w+)?"?\s*$', content)
-    if match:
-        return int(match.group(1))
-    # Match --port flag in command
-    match = re.search(r'--port\s+(\d+)', content)
-    if match:
-        return int(match.group(1))
-    # Host-network / env-driven ports (no ports: mapping), e.g. VLLM_PORT: "8976"
-    match = re.search(
-        r'(?m)^\s*(?:VLLM_PORT|HOST_PORT|PORT):\s*["\']?(\d+)["\']?\s*$',
-        content,
-    )
-    if match:
-        return int(match.group(1))
-    raise RuntimeError(f"Cannot extract port from {compose_file}")
-
-
-def extract_model_from_compose(compose_file: Path) -> str:
-    """Extract model path from a docker-compose yml file."""
-    content = compose_file.read_text(encoding="utf-8")
-    model: str | None = None
-    # Try --model / --model-path / GGUF-style -m
-    m = re.search(r"(?:--model(?:-path)?|-m)(?:=|\s+)([^\s\"']+)", content)
-    if m:
-        model = _resolve_env_default(m.group(1))
-    if not model:
-        # Try "<engine> serve <model>" (e.g. "vllm serve ...", "tokenspeed serve ...")
-        m = re.search(r"\w+\s+serve\s+([^\s\"'\\]+)", content)
-        if m:
-            model = _resolve_env_default(m.group(1))
-    if not model:
-        # Host-network / env-driven model path, e.g. MODEL_PATH: /models
-        m = re.search(
-            r'(?m)^\s*(?:MODEL_PATH|MODEL_DIR|MODEL|TOKENIZER):\s*["\']?([^"\'\s]+)["\']?\s*$',
-            content,
-        )
-        if m:
-            model = _resolve_env_default(m.group(1))
-    if not model:
-        raise RuntimeError(f"Cannot extract model from {compose_file}")
-    return _remap_model_via_volumes(model, content)
-
-
-def extract_served_model_name(compose_file: Path) -> str | None:
-    content = compose_file.read_text(encoding="utf-8")
-    m = re.search(r"(?:--served-model-name|--alias)(?:=|\s+)([^\s\"']+)", content)
-    if m:
-        return _resolve_env_default(m.group(1))
-    m = re.search(
-        r'(?m)^\s*(?:SERVED_MODEL_NAME|MODEL_NAME):\s*["\']?([^"\'\s]+)["\']?\s*$',
-        content,
-    )
-    return _resolve_env_default(m.group(1)) if m else None
-
-
-def extract_tp_from_compose(compose_file: Path) -> str:
-    """Extract tensor-parallel-size from a docker-compose yml file."""
-    content = compose_file.read_text(encoding="utf-8")
-    m = re.search(r"--tensor-parallel-size(?:=|\s+)([^\s\"']+)", content)
-    if m:
-        return _resolve_env_default(m.group(1))
-    m = re.search(
-        r'(?m)^\s*(?:TP_SIZE|TENSOR_PARALLEL|TENSOR_PARALLEL_SIZE):\s*["\']?([^"\'\s]+)["\']?\s*$',
-        content,
-    )
-    if m:
-        return _resolve_env_default(m.group(1))
-    return "1"
-
-
-def _resolve_env_default(value: str) -> str:
-    """Resolve ${VAR:-default} to just 'default'. Pass through literals."""
-    m = re.match(r'^\$\{[^:}]+:-(.+)\}$', value)
-    if m:
-        return m.group(1)
-    return value
-
-
-def _remap_model_via_volumes(model: str, compose_text: str) -> str:
-    """Map a container model path to the host bind-mount source when possible."""
-    if not model:
-        return model
-    # Paths must not span whitespace/newlines or a bind without :mode eats the next line.
-    vol_re = r'(?m)^\s*-\s*["\']?([^\s:"\']+):([^\s:"\']+)(?::[^\s"\']*)?["\']?\s*$'
-    for match in re.finditer(vol_re, compose_text):
-        source, target = match.group(1).strip(), match.group(2).strip()
-        if not source.startswith(("./", "../", "/")):
-            continue
-        if model == target or model.startswith(target.rstrip("/") + "/"):
-            suffix = model[len(target):] if model.startswith(target) else ""
-            return f"{source}{suffix}"
-    return model
-
-
-def compose_up(compose_file: Path) -> None:
+def compose_up(compose_file: Path, extra_env: dict[str, str] | None = None) -> None:
     cwd = compose_file.parent
     name = compose_file.name
     cmd = ["docker", "compose", "-f", name, "up", "-d"]
@@ -300,7 +215,12 @@ def compose_up(compose_file: Path) -> None:
     # Register before starting so an interrupt mid-startup still triggers a
     # teardown of the (possibly partially) started service.
     _register_active_compose(compose_file)
-    run_cmd(cmd, cwd=cwd)
+    if extra_env:
+        env = os.environ.copy()
+        env.update({k: str(v) for k, v in extra_env.items()})
+        subprocess.run(cmd, cwd=str(cwd), check=True, text=True, env=env)
+    else:
+        run_cmd(cmd, cwd=cwd)
 
 
 def compose_down(compose_file: Path) -> None:
@@ -393,6 +313,20 @@ def run_test(
         raise RuntimeError(
             f"Test {test_script.name} failed with exit code {returncode}"
         )
+
+
+
+# ---------------------------------------------------------------------------
+# Optuna server-arg optimization (--optuna)
+#
+# Implementation lives in optuna_runner.py (flat opt.yml: args only).
+# Relative paths resolve against process CWD (prefer: run from auto/).
+# ---------------------------------------------------------------------------
+
+def run_optuna(opt_path: Path) -> int:
+    """Thin wrapper: delegate to optuna_runner.run_optuna."""
+    from optuna_runner import run_optuna as _run_optuna
+    return _run_optuna(opt_path)
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +435,14 @@ Config format (--config):
                         help="Health check timeout in seconds (default: 2160)")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument(
+        "--optuna",
+        type=Path,
+        default=None,
+        metavar="OPT_YML",
+        help="Run Optuna server-arg optimization from the given opt.yml "
+             "(relative paths resolve against CWD; prefer running from auto/).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -509,6 +451,11 @@ Config format (--config):
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+
+    if args.optuna is not None:
+        set_nostop(False)
+        install_signal_handlers()
+        return run_optuna(args.optuna)
 
     set_nostop(args.nostop)
     install_signal_handlers()

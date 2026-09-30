@@ -3,8 +3,11 @@
 
 Usage:
     python3 export.py [--results-dir ./results] [--output-dir ./export]
+    python3 auto/export.py --optuna [./auto/example-opt-dir/opt.yml]
 
 Extracts key metrics from all CSV files in results dir and merges into one CSV.
+With --optuna, print a minimal summary (best params + success/failed/skip).
+No Notion. Default opt.yml: ./auto/example-opt-dir/opt.yml from repo root.
 """
 from __future__ import annotations
 
@@ -740,6 +743,217 @@ def merge_json_results(results_dir: Path, output_path: Path) -> None:
     print(f"[export] Full JSON ({len(all_benchmarks)} benchmarks) -> {output_path}")
 
 
+
+def _resolve_cwd_path(raw: str | Path) -> Path:
+    """Resolve a path relative to process CWD (absolute paths unchanged)."""
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return (Path.cwd() / p).resolve()
+
+
+def summarize_optuna(opt_path: Path | None = None) -> int:
+    """Print a minimal Optuna summary: best params + success/failed/skip + timing.
+
+    Default opt.yml (from repo root): ./auto/example-opt-dir/opt.yml.
+    Reads best_params.json / study_stats.json under opt.yml ``output``.
+    No Notion.
+    """
+    import json
+
+    script_dir = Path(__file__).resolve().parent
+    if opt_path is None:
+        candidates = [
+            Path.cwd() / "auto" / "example-opt-dir" / "opt.yml",
+            Path.cwd() / "example-opt-dir" / "opt.yml",
+            script_dir / "example-opt-dir" / "opt.yml",
+        ]
+        opt_path = next((p for p in candidates if p.is_file()), candidates[0])
+    else:
+        opt_path = _resolve_cwd_path(opt_path)
+
+    if not opt_path.is_file():
+        print(f"[error] opt.yml not found: {opt_path}", file=sys.stderr)
+        return 1
+
+    try:
+        import yaml
+    except ImportError:
+        print(
+            "[error] PyYAML is required for --optuna. Install with: pip install pyyaml",
+            file=sys.stderr,
+        )
+        return 1
+
+    with opt_path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    if not isinstance(cfg, dict):
+        print(f"[error] opt.yml must be a mapping: {opt_path}", file=sys.stderr)
+        return 1
+
+    output_root = _resolve_cwd_path(cfg.get("output", "./auto/results/optuna"))
+    best_params_path = output_root / "best_params.json"
+    stats_path = output_root / "study_stats.json"
+
+    data: dict = {}
+    if best_params_path.is_file():
+        try:
+            loaded = json.loads(best_params_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception as exc:
+            print(f"[error] failed to read {best_params_path}: {exc}", file=sys.stderr)
+            return 1
+    elif not stats_path.is_file():
+        print(
+            f"[error] no Optuna results under {output_root} "
+            f"(missing best_params.json / study_stats.json)",
+            file=sys.stderr,
+        )
+        print(
+            "[hint] Run: bash auto/optuna.sh ./auto/example-opt-dir/opt.yml",
+            file=sys.stderr,
+        )
+        return 1
+
+    # --- best params (if any completed trial was written) ---
+    if data:
+        if "best_trial" in data:
+            print(f"[optuna] best trial: #{data['best_trial']}")
+        if "best_value" in data:
+            print(f"[optuna] best value: {data['best_value']}")
+        args_best = data.get("args") or data.get("params") or {}
+        if args_best:
+            print("[optuna] best params:")
+            for k in sorted(args_best):
+                value = args_best[k]
+                if isinstance(value, bool):
+                    print(f"  --{k}  ({'on' if value else 'off'})")
+                else:
+                    print(f"  --{k} {value}")
+    else:
+        print("[optuna] best params: (none — no completed trials)")
+
+    # --- success / failed / skip ---
+    stats = data.get("stats") if isinstance(data.get("stats"), dict) else None
+    if stats is None and stats_path.is_file():
+        try:
+            loaded_stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_stats, dict):
+                stats = loaded_stats
+        except Exception as exc:
+            print(f"[warn] failed to read {stats_path}: {exc}", file=sys.stderr)
+
+    if stats is not None:
+        print(
+            "[optuna] summary: success=%s failed=%s skip=%s"
+            % (
+                stats.get("success", 0),
+                stats.get("failed", 0),
+                stats.get("skip", 0),
+            )
+        )
+    else:
+        print("[optuna] summary: success=? failed=? skip=? (stats not recorded)")
+
+    # --- timing (total / per-trial / averages) ---
+    total_sec = None
+    avg_sec = None
+    avg_sec_success = None
+    trials_timing = None
+    if stats is not None:
+        if "total_sec" in stats:
+            total_sec = stats.get("total_sec")
+        if "avg_sec" in stats:
+            avg_sec = stats.get("avg_sec")
+        if "avg_sec_success" in stats:
+            avg_sec_success = stats.get("avg_sec_success")
+        if isinstance(stats.get("trials"), list):
+            trials_timing = stats["trials"]
+    if total_sec is None and "total_sec" in data:
+        total_sec = data.get("total_sec")
+    if avg_sec is None and "avg_sec" in data:
+        avg_sec = data.get("avg_sec")
+    if avg_sec_success is None and "avg_sec_success" in data:
+        avg_sec_success = data.get("avg_sec_success")
+
+    # Fallback: trials.csv duration_sec column
+    trials_csv_path = output_root / "trials.csv"
+    if trials_timing is None and trials_csv_path.is_file():
+        try:
+            import csv as _csv
+
+            rows = []
+            with trials_csv_path.open("r", encoding="utf-8", newline="") as f:
+                reader = _csv.DictReader(f)
+                for row in reader:
+                    num = row.get("number") or row.get("number_0")
+                    dur = row.get("duration_sec") or row.get(
+                        "user_attrs_duration_sec"
+                    )
+                    outcome = row.get("outcome") or row.get("user_attrs_outcome")
+                    if num is None or dur in (None, ""):
+                        continue
+                    try:
+                        rows.append(
+                            {
+                                "number": int(float(num)),
+                                "duration_sec": float(dur),
+                                "outcome": outcome or "?",
+                            }
+                        )
+                    except (TypeError, ValueError):
+                        continue
+            if rows:
+                trials_timing = sorted(rows, key=lambda r: r["number"])
+                if total_sec is None:
+                    total_sec = round(
+                        sum(r["duration_sec"] for r in trials_timing), 3
+                    )
+                if avg_sec is None:
+                    avg_sec = round(
+                        sum(r["duration_sec"] for r in trials_timing)
+                        / len(trials_timing),
+                        3,
+                    )
+                if avg_sec_success is None:
+                    succ = [
+                        r["duration_sec"]
+                        for r in trials_timing
+                        if r.get("outcome") == "success"
+                    ]
+                    if succ:
+                        avg_sec_success = round(sum(succ) / len(succ), 3)
+        except Exception as exc:
+            print(f"[warn] failed to read {trials_csv_path}: {exc}", file=sys.stderr)
+
+    if total_sec is not None:
+        print(f"[optuna] total time: {total_sec}s")
+    else:
+        print("[optuna] total time: (not recorded)")
+
+    if trials_timing:
+        print("[optuna] trial times:")
+        for t in trials_timing:
+            num = t.get("number", "?")
+            dur = t.get("duration_sec", "?")
+            outcome = t.get("outcome", "?")
+            print(f"  trial {num}: {dur}s ({outcome})")
+    else:
+        print("[optuna] trial times: (not recorded)")
+
+    if avg_sec is not None:
+        msg = f"[optuna] average time: {avg_sec}s (all finished)"
+        if avg_sec_success is not None:
+            msg += f"; {avg_sec_success}s (success only)"
+        print(msg)
+    else:
+        print("[optuna] average time: (not recorded)")
+
+    return 0
+
+
 def main() -> int:
     script_dir = Path(__file__).resolve().parent
 
@@ -753,7 +967,20 @@ def main() -> int:
     parser.add_argument("--report", action="store_true",
                         help="Generate analysis report via OpenAI and upload to Notion. "
                              "Requires OPENAI_API_KEY and OPENAI_API_URL in .env")
+    parser.add_argument(
+        "--optuna",
+        nargs="?",
+        const="DEFAULT",
+        default=None,
+        metavar="OPT_YML",
+        help="Print minimal Optuna summary (best params + success/failed/skip + timing). "
+             "Default: ./auto/example-opt-dir/opt.yml from repo root. No Notion.",
+    )
     args = parser.parse_args()
+
+    if args.optuna is not None:
+        opt_path = None if args.optuna == "DEFAULT" else Path(args.optuna)
+        return summarize_optuna(opt_path)
 
     results_dir: Path = args.results_dir.resolve()
     output_dir: Path = args.output_dir.resolve()
