@@ -817,12 +817,35 @@ def summarize_optuna(opt_path: Path | None = None) -> int:
         )
         return 1
 
+    # Read the standalone stats artifact as well. Older best_params.json files
+    # may not contain the counters, metric, or direction persisted there.
+    stats: dict | None = None
+    if stats_path.is_file():
+        try:
+            loaded_stats = json.loads(stats_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_stats, dict):
+                stats = loaded_stats
+        except Exception as exc:
+            print(f"[warn] failed to read {stats_path}: {exc}", file=sys.stderr)
+
+    metric = data.get("metric") or (stats or {}).get("metric") or cfg.get("metric")
+    direction = (
+        data.get("direction")
+        or (stats or {}).get("direction")
+        or cfg.get("direction", "maximize")
+    )
+
     # --- best params (if any completed trial was written) ---
     if data:
         if "best_trial" in data:
             print(f"[optuna] best trial: #{data['best_trial']}")
         if "best_value" in data:
-            print(f"[optuna] best value: {data['best_value']}")
+            if metric:
+                print(f"[optuna] best {metric}: {data['best_value']}")
+            else:
+                print(f"[optuna] best value: {data['best_value']}")
+        if direction:
+            print(f"[optuna] direction: {direction}")
         args_best = data.get("args") or data.get("params") or {}
         if args_best:
             print("[optuna] best params:")
@@ -836,14 +859,9 @@ def summarize_optuna(opt_path: Path | None = None) -> int:
         print("[optuna] best params: (none — no completed trials)")
 
     # --- success / failed / skip ---
-    stats = data.get("stats") if isinstance(data.get("stats"), dict) else None
-    if stats is None and stats_path.is_file():
-        try:
-            loaded_stats = json.loads(stats_path.read_text(encoding="utf-8"))
-            if isinstance(loaded_stats, dict):
-                stats = loaded_stats
-        except Exception as exc:
-            print(f"[warn] failed to read {stats_path}: {exc}", file=sys.stderr)
+    embedded_stats = data.get("stats") if isinstance(data.get("stats"), dict) else None
+    if embedded_stats is not None:
+        stats = embedded_stats
 
     if stats is not None:
         print(

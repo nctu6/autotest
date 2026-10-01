@@ -680,6 +680,8 @@ def run_optuna(opt_path: Path) -> int:
         "success": stats["success"],
         "failed": stats["failed"],
         "skip": stats["skip"],
+        "metric": metric_key,
+        "direction": direction,
         "total_sec": total_sec,
         "avg_sec": avg_sec,
         "avg_sec_success": avg_sec_success,
@@ -708,13 +710,6 @@ def run_optuna(opt_path: Path) -> int:
             best_params[k[4:]] = v
         else:
             best_params[k] = v
-
-    LOG.info(
-        "[optuna] best trial #%s value=%s params=%s",
-        best.number,
-        best.value,
-        best_params,
-    )
 
     best_params_path = output_root / "best_params.json"
     dotenv_path = output_root / ".env"
@@ -759,6 +754,25 @@ def run_optuna(opt_path: Path) -> int:
         LOG.info("[optuna] wrote %s", trials_csv_path)
     except Exception as exc:
         LOG.warning("[optuna] failed to write trials.csv: %s", exc)
+
+    # Keep the end-of-run summary readable and consistent with export.py.
+    LOG.info("[optuna] best trial: #%s", best.number)
+    LOG.info("[optuna] best %s: %s", metric_key, best.value)
+    LOG.info("[optuna] direction: %s", direction)
+    LOG.info("[optuna] best params:")
+    for key in sorted(best_params):
+        value = best_params[key]
+        if isinstance(value, bool):
+            LOG.info("  --%s  (%s)", key, "on" if value else "off")
+        else:
+            LOG.info("  --%s %s", key, value)
+    LOG.info(
+        "[optuna] summary: success=%s failed=%s skip=%s",
+        stats["success"],
+        stats["failed"],
+        stats["skip"],
+    )
+    LOG.info("[optuna] total time: %ss", total_sec)
 
     return 0
 
